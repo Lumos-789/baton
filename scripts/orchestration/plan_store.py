@@ -58,6 +58,15 @@ PRIORITY_RANK = {
     "emergency": 30,
 }
 
+#: Attempt states that never transition again. ``superseded`` (a stale lease
+#: replaced by a retry) and ``abandoned`` (operator escape hatch) are terminal
+#: for scheduling purposes but deliberately kept as distinct audit states.
+TERMINAL_ATTEMPT_STATES = frozenset(
+    {"succeeded", "failed", "canceled", "superseded", "abandoned"}
+)
+
+VERIFICATION_COMMANDS_SETTING = "verification_commands"
+
 
 def _pretty_json(data: dict[str, Any]) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
@@ -429,7 +438,7 @@ class PlanStore:
             conn.execute("BEGIN IMMEDIATE")
             row = self._load_execution_attempt_locked(conn, assignment_id)
             self._require_claim_token(row, claim_token)
-            if row["state"] in {"succeeded", "failed", "canceled"}:
+            if row["state"] in TERMINAL_ATTEMPT_STATES:
                 raise ExecutionAttemptError(f"attempt is terminal: {assignment_id}")
             expires_at = _utc_after(lease_seconds)
             now = utc_now()
@@ -528,7 +537,7 @@ class PlanStore:
             conn.execute("BEGIN IMMEDIATE")
             row = self._load_execution_attempt_locked(conn, assignment_id)
             self._require_claim_token(row, claim_token)
-            if row["state"] in {"succeeded", "failed", "canceled"}:
+            if row["state"] in TERMINAL_ATTEMPT_STATES:
                 raise ExecutionAttemptError(f"attempt is terminal: {assignment_id}")
             now = utc_now()
             conn.execute(
@@ -561,6 +570,161 @@ class PlanStore:
             conn.close()
         return self.get_execution_attempt(assignment_id)
 
+    def expire_execution_attempts(self) -> None:
+        """Mark every attempt past its lease ``unknown`` and free its resources.
+
+        Called by the controller before planning a batch so an expired lease is
+        never re-dispatched as if it were still owned. ``failure_code`` is set
+        to ``lease-expired``; the attempt can then be retried (superseded once
+        a successor exists) or abandoned by the operator.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._expire_execution_attempts_locked(conn)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def supersede_execution_attempt(
+        self,
+        assignment_id: str,
+        *,
+        success_assignment_id: str = "",
+        failure_code: str = "superseded-by-retry",
+    ) -> ExecutionAttempt:
+        """Retire a stale attempt that a newer attempt for the ticket replaced."""
+        return self._resolve_execution_attempt(
+            assignment_id,
+            state="superseded",
+            failure_code=(
+                f"{failure_code} (successor {success_assignment_id})"
+                if success_assignment_id
+                else failure_code
+            ),
+        )
+
+    def abandon_execution_attempt(
+        self,
+        assignment_id: str,
+        *,
+        reason: str = "operator-abandoned",
+    ) -> ExecutionAttempt:
+        """Operator escape hatch: retire a stuck attempt without touching git.
+
+        Releases the attempt's resource leases and marks it ``abandoned`` so
+        the ticket becomes claimable again. It deliberately does **not** remove
+        the assignment worktree/branch, its commits, packet or receipt — those
+        stay on disk for audit. It only destroys the attempt's ability to be
+        reconciled: any later receipt is ignored.
+        """
+        return self._resolve_execution_attempt(
+            assignment_id, state="abandoned", failure_code=reason
+        )
+
+    def _resolve_execution_attempt(
+        self,
+        assignment_id: str,
+        *,
+        state: str,
+        failure_code: str,
+    ) -> ExecutionAttempt:
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = self._load_execution_attempt_locked(conn, assignment_id)
+            if row["state"] in TERMINAL_ATTEMPT_STATES:
+                raise ExecutionAttemptError(
+                    f"attempt is already terminal ({row['state']}): {assignment_id}"
+                )
+            now = utc_now()
+            conn.execute(
+                "UPDATE execution_attempts SET state = ?, failure_code = ?, "
+                "updated_at = ? WHERE job_id = ? AND assignment_id = ?",
+                (state, failure_code, now, self.job_id, assignment_id),
+            )
+            conn.execute(
+                "UPDATE assignments SET state = ?, updated_at = ? "
+                "WHERE job_id = ? AND assignment_id = ?",
+                (state, now, self.job_id, assignment_id),
+            )
+            conn.execute(
+                "DELETE FROM attempt_resource_leases "
+                "WHERE job_id = ? AND assignment_id = ?",
+                (self.job_id, assignment_id),
+            )
+            self._event_locked(
+                conn,
+                f"execution.attempt.{state}",
+                {
+                    "assignmentId": assignment_id,
+                    "failureCode": failure_code,
+                    "leaseReleased": True,
+                },
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return self.get_execution_attempt(assignment_id)
+
+    def run_verification_commands(self) -> list[str]:
+        """Return the verification commands persisted for this run, if any.
+
+        The controller persists the commands on the first claim so every later
+        packet for the run reuses them even when the CLI call that follows does
+        not repeat ``--verify``.
+        """
+        self.ensure_initial_plan()
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT value_json FROM run_settings "
+                "WHERE job_id = ? AND setting_key = ?",
+                (self.job_id, VERIFICATION_COMMANDS_SETTING),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return []
+        try:
+            value = json.loads(row["value_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise PlanStoreError(
+                f"run settings {VERIFICATION_COMMANDS_SETTING} are corrupt: {exc}"
+            ) from exc
+        if not isinstance(value, list):
+            raise PlanStoreError(
+                f"run settings {VERIFICATION_COMMANDS_SETTING} must be a list, "
+                f"got {type(value).__name__}"
+            )
+        return [str(item) for item in value]
+
+    def set_run_verification_commands(self, commands: list[str]) -> None:
+        """Persist the run-wide verification commands (explicit override wins)."""
+        normalized = [str(command) for command in commands]
+        if not normalized:
+            raise PlanStoreError("verification commands must not be empty")
+        self.ensure_initial_plan()
+        now = utc_now()
+        payload = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT INTO run_settings (job_id, setting_key, value_json, updated_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(job_id, setting_key) DO UPDATE SET "
+                "value_json = excluded.value_json, updated_at = excluded.updated_at",
+                (self.job_id, VERIFICATION_COMMANDS_SETTING, payload, now),
+            )
+            self._event_locked(
+                conn,
+                "run.settings.verification-commands",
+                {"commands": normalized},
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     def finalize_execution_attempt(
         self,
         assignment_id: str,
@@ -577,6 +741,8 @@ class PlanStore:
             if row["state"] == "succeeded":
                 conn.commit()
                 return self.get_execution_attempt(assignment_id)
+            if row["state"] in TERMINAL_ATTEMPT_STATES:
+                raise ExecutionAttemptError(f"attempt is terminal: {assignment_id}")
             if envelope.status != "succeeded":
                 raise ExecutionAttemptError("only succeeded sealed receipts can finalize")
             expected = {
@@ -1254,6 +1420,13 @@ class PlanStore:
             );
             CREATE INDEX IF NOT EXISTS idx_attempt_resource_leases_job
               ON attempt_resource_leases(job_id, assignment_id);
+            CREATE TABLE IF NOT EXISTS run_settings (
+              job_id TEXT NOT NULL,
+              setting_key TEXT NOT NULL,
+              value_json TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY (job_id, setting_key)
+            );
             CREATE INDEX IF NOT EXISTS idx_result_envelopes_job
               ON result_envelopes(job_id, ticket_num);
             """
@@ -1683,6 +1856,11 @@ class PlanStore:
             conn.execute(
                 "UPDATE execution_attempts SET state = 'unknown', failure_code = 'lease-expired', "
                 "updated_at = ? WHERE job_id = ? AND assignment_id = ?",
+                (now, self.job_id, assignment_id),
+            )
+            conn.execute(
+                "UPDATE assignments SET state = 'unknown', updated_at = ? "
+                "WHERE job_id = ? AND assignment_id = ?",
                 (now, self.job_id, assignment_id),
             )
             conn.execute(

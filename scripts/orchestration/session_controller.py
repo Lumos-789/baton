@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import subprocess
@@ -12,7 +11,12 @@ from typing import Any
 
 from orchestration.integrator import integrate_assignment
 from orchestration.model import ROLE_BUILDER, TaskPacket
-from orchestration.plan_store import ExecutionAttemptError, PlanStore
+from orchestration.plan_store import (
+    ExecutionAttemptError,
+    PlanStore,
+    TERMINAL_ATTEMPT_STATES,
+)
+from orchestration.receipt import ReceiptError, verify_sealed_receipt
 from orchestration.result import ResultEnvelope
 from orchestration.worktree import cleanup_feature_worktrees
 from orchestration.session_model import (
@@ -51,9 +55,10 @@ class SessionController:
         self.project_path = Path(project_path).resolve()
         self.feature = feature
         self.store = PlanStore(self.project_path, feature)
-        self.verification_commands = list(
-            verification_commands or ["git diff --check"]
-        )
+        # No implicit fallback: an unconfigured run must fail loud instead of
+        # silently verifying with ``git diff --check``. Commands passed here
+        # are persisted on the first batch and reused by every later packet.
+        self.verification_commands = list(verification_commands or [])
         self.lease_seconds = lease_seconds
 
     def actions(
@@ -68,6 +73,10 @@ class SessionController:
         if capacity < 1 or capacity > 5:
             raise ValueError("capacity must be between 1 and 5")
         self.store.ensure_initial_plan()
+        # A lease that ran out is no longer owned: retire it before planning so
+        # a stale attempt is never re-dispatched as if it were still running.
+        self.store.expire_execution_attempts()
+        verification_commands = self._run_verification_commands()
 
         try:
             integration = prepare_integration_worktree(
@@ -81,29 +90,74 @@ class SessionController:
             )
 
         produced: list[Any] = []
+        # Pass 1: reconcile every valid sealed receipt, including receipts whose
+        # attempt lease ran out (the evidence is re-verified, not trusted by age).
         for attempt in self.store.list_execution_attempts():
-            if attempt.state == "succeeded":
+            if attempt.state in TERMINAL_ATTEMPT_STATES:
                 continue
             token = self._token_from_packet(attempt.packet_path)
-            if attempt.receipt_path and Path(attempt.receipt_path).is_file() and token:
+            if not token or attempt.failure_code.startswith("receipt-invalid"):
+                continue
+            if attempt.receipt_path and Path(attempt.receipt_path).is_file():
                 action = self._reconcile_sealed(attempt, token)
                 if action is not None:
                     produced.append(action)
+
+        # Pass 2: resolve stale attempts, re-dispatch this session's claims and
+        # surface only recoveries that still need an operator decision.
+        attempts = self.store.list_execution_attempts()
+        recover_actions: list[RecoverAction] = []
+        retryable_recover_ids: set[str] = set()
+        for attempt in attempts:
+            if attempt.state in TERMINAL_ATTEMPT_STATES:
                 continue
-            if attempt.state == "unknown":
-                produced.append(
+            token = self._token_from_packet(attempt.packet_path)
+            if attempt.failure_code.startswith("receipt-invalid"):
+                recover_actions.append(
                     RecoverAction(
                         assignment_id=attempt.assignment_id,
                         ticket_num=attempt.ticket_num,
-                        reason=attempt.failure_code or "attempt outcome is unknown",
+                        reason=attempt.failure_code,
                     )
                 )
+                continue
+            if attempt.receipt_path and Path(attempt.receipt_path).is_file() and token:
+                continue
+            if attempt.state == "unknown":
+                successor = self._successor_with_sealed_receipt(attempt, attempts)
+                if successor is not None:
+                    self.store.supersede_execution_attempt(
+                        attempt.assignment_id,
+                        success_assignment_id=successor.assignment_id,
+                        failure_code="superseded-by-successor-receipt",
+                    )
+                    continue
+                reason = attempt.failure_code or "attempt outcome is unknown"
+                recover_actions.append(
+                    RecoverAction(
+                        assignment_id=attempt.assignment_id,
+                        ticket_num=attempt.ticket_num,
+                        reason=reason,
+                    )
+                )
+                if reason == "lease-expired":
+                    # A dead lease is retryable: allow the claim below to
+                    # replace this attempt instead of deadlocking the run.
+                    retryable_recover_ids.add(attempt.assignment_id)
             elif attempt.state == "blocked-review":
                 produced.append(self._merge_action(attempt, token))
             elif attempt.session_id == session_id and attempt.state == "leased" and token:
                 produced.append(self._dispatch_from_attempt(attempt, token))
 
-        if not any(isinstance(action, (RecoverAction, ResolveMergeAction)) for action in produced):
+        blocking_recover = [
+            action
+            for action in recover_actions
+            if action.assignment_id not in retryable_recover_ids
+        ]
+        if not any(
+            isinstance(action, (ResolveMergeAction, BlockedAction))
+            for action in produced
+        ) and not blocking_recover:
             claimed = self.store.claim_ready_assignments(
                 session_id=session_id,
                 capacity=capacity,
@@ -114,7 +168,12 @@ class SessionController:
             for attempt in claimed:
                 try:
                     produced.append(
-                        self._prepare_dispatch(attempt, integration.path, integration.branch)
+                        self._prepare_dispatch(
+                            attempt,
+                            integration.path,
+                            integration.branch,
+                            verification_commands,
+                        )
                     )
                 except Exception as exc:
                     self.store.mark_execution_attempt_state(
@@ -131,6 +190,30 @@ class SessionController:
                             reason=f"assignment preparation failed: {exc}",
                         )
                     )
+            # A retry replaces the stale attempt for that ticket: retire the
+            # old attempt now so it never emits ``recover`` again.
+            claimed_by_ticket = {
+                attempt.ticket_num: attempt.assignment_id for attempt in claimed
+            }
+            if claimed_by_ticket and recover_actions:
+                remaining: list[RecoverAction] = []
+                for action in recover_actions:
+                    successor_id = claimed_by_ticket.get(action.ticket_num)
+                    if successor_id is None:
+                        remaining.append(action)
+                        continue
+                    try:
+                        self.store.supersede_execution_attempt(
+                            action.assignment_id,
+                            success_assignment_id=successor_id,
+                            failure_code="superseded-by-retry",
+                        )
+                    except ExecutionAttemptError:
+                        # It became terminal between pass 2 and the claim; the
+                        # successor still owns the ticket, so drop the recovery.
+                        pass
+                recover_actions = remaining
+        produced.extend(recover_actions)
 
         if produced:
             state = "blocked" if any(
@@ -184,6 +267,27 @@ class SessionController:
     ) -> ExecutionAttempt:
         return self.store.bind_attempt_agent(assignment_id, claim_token, agent_id)
 
+    def abandon(
+        self, assignment_id: str, *, reason: str = "operator-abandoned"
+    ) -> dict[str, Any]:
+        """Retire a stuck attempt and tell the operator exactly what that costs."""
+        attempt = self.store.abandon_execution_attempt(assignment_id, reason=reason)
+        return {
+            "assignmentId": attempt.assignment_id,
+            "ticketNum": attempt.ticket_num,
+            "state": attempt.state,
+            "failureCode": attempt.failure_code,
+            "destroys": (
+                "this attempt's lease and its eligibility for reconcile; any "
+                "later receipt from it is ignored"
+            ),
+            "preserves": (
+                "the assignment worktree, branch, commits, packet and receipt "
+                "on disk"
+            ),
+            "next": "the ticket can be claimed again by the next `actions` call",
+        }
+
     def status(self) -> dict[str, Any]:
         """Return a read-only snapshot from the durable session state."""
         plan = self.store.current_plan()
@@ -219,6 +323,10 @@ class SessionController:
         if agent_terminal not in {"completed", "failed", "canceled"}:
             raise ValueError("agent_terminal must be completed, failed, or canceled")
         attempt = self.store.get_execution_attempt(assignment_id)
+        if attempt.state in TERMINAL_ATTEMPT_STATES and attempt.state != "succeeded":
+            # The attempt was retired (superseded by a retry, or abandoned); a
+            # late terminal notice cannot change it, and must not wedge the run.
+            return self.actions(session_id, capacity=capacity, base_branch=base_branch)
         if attempt.state != "succeeded":
             if not attempt.receipt_path or not Path(attempt.receipt_path).is_file():
                 self.store.mark_execution_attempt_state(
@@ -232,8 +340,79 @@ class SessionController:
                 self._reconcile_sealed(attempt, claim_token)
         return self.actions(session_id, capacity=capacity, base_branch=base_branch)
 
+    def _run_verification_commands(self) -> list[str]:
+        """Resolve the run-wide commands, persist an explicit override, fail loud.
+
+        ``--verify`` is persisted with the run on the first claim, so a later
+        ``reconcile``/``actions`` call that omits the flag keeps using the same
+        commands instead of falling back to some implicit default.
+        """
+        if self.verification_commands:
+            commands = list(self.verification_commands)
+            if self.store.run_verification_commands() != commands:
+                self.store.set_run_verification_commands(commands)
+            return commands
+        stored = self.store.run_verification_commands()
+        if stored:
+            return stored
+        inherited = self._commands_from_existing_packets()
+        if inherited:
+            self.store.set_run_verification_commands(inherited)
+            return inherited
+        if self.store.latest_completion()["complete"]:
+            return []
+        raise SessionControllerError(
+            f"no verification commands configured for run {self.feature!r}; "
+            'pass --verify "<command>" on actions (or reconcile) — it is persisted '
+            "for every packet in the run"
+        )
+
+    def _commands_from_existing_packets(self) -> list[str]:
+        """Adopt the commands of an in-flight run created before persistence."""
+        for attempt in self.store.list_execution_attempts():
+            if not attempt.packet_path or not Path(attempt.packet_path).is_file():
+                continue
+            try:
+                payload = json.loads(
+                    Path(attempt.packet_path).read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                continue
+            raw = payload.get("taskPacket", {}).get("verification_commands")
+            if isinstance(raw, list) and raw:
+                return [str(command) for command in raw]
+        return []
+
+    def _successor_with_sealed_receipt(
+        self, attempt: ExecutionAttempt, attempts: list[ExecutionAttempt]
+    ) -> ExecutionAttempt | None:
+        """Return a newer attempt for the same ticket that already has evidence."""
+        later = sorted(
+            (
+                candidate
+                for candidate in attempts
+                if candidate.ticket_num == attempt.ticket_num
+                and candidate.attempt > attempt.attempt
+            ),
+            key=lambda candidate: candidate.attempt,
+        )
+        for candidate in later:
+            if candidate.state in {"abandoned", "superseded"}:
+                continue
+            if candidate.state == "succeeded":
+                return candidate
+            if candidate.failure_code.startswith("receipt-invalid"):
+                continue
+            if candidate.receipt_path and Path(candidate.receipt_path).is_file():
+                return candidate
+        return None
+
     def _prepare_dispatch(
-        self, attempt: ExecutionAttempt, integration_path: Path, integration_branch: str
+        self,
+        attempt: ExecutionAttempt,
+        integration_path: Path,
+        integration_branch: str,
+        verification_commands: list[str],
     ) -> DispatchAction:
         slot = prepare_assignment_worktree(
             self.project_path,
@@ -253,7 +432,7 @@ class SessionController:
                 base_commit=attempt.base_sha,
                 project_path=str(slot.path),
                 resources=list(ticket.resources),
-                verification_commands=list(ticket.verify) or list(self.verification_commands),
+                verification_commands=list(ticket.verify) or list(verification_commands),
                 output_contract=["sealed receipt"],
                 plan_revision=attempt.plan_revision,
             )
@@ -332,12 +511,18 @@ class SessionController:
             payload = json.loads(receipt_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise SessionControllerError(f"cannot read sealed receipt: {exc}") from exc
-        expected_token_hash = hashlib.sha256(claim_token.encode("utf-8")).hexdigest()
-        if payload.get("claimTokenHash") != expected_token_hash:
-            raise ExecutionAttemptError("sealed receipt claim token mismatch")
-        envelope = ResultEnvelope.from_dict(payload)
-        if envelope.task_packet_hash != attempt.task_packet_hash:
-            raise ExecutionAttemptError("sealed receipt task packet hash mismatch")
+        try:
+            envelope = verify_sealed_receipt(
+                payload,
+                claim_token=claim_token,
+                task_packet_hash=attempt.task_packet_hash,
+            )
+            self._check_receipt_identity(attempt, envelope)
+        except ReceiptError as exc:
+            self._reject_receipt(attempt, claim_token, str(exc))
+            raise SessionControllerError(
+                f"sealed receipt rejected for {attempt.assignment_id}: {exc}"
+            ) from exc
         self.store.mark_execution_attempt_state(
             attempt.assignment_id, claim_token, "integrating"
         )
@@ -357,6 +542,49 @@ class SessionController:
             str(result["integration_sha"]),
         )
         return None
+
+    @staticmethod
+    def _check_receipt_identity(
+        attempt: ExecutionAttempt, envelope: ResultEnvelope
+    ) -> None:
+        """Bind the sealed receipt to this exact attempt *before* integrating.
+
+        ``finalize_execution_attempt`` repeats these checks as a last line of
+        defence, but by then the branch has already been merged — a receipt for
+        another ticket must be rejected while the attempt is still recoverable.
+        """
+        expected = {
+            "status": "succeeded",
+            "assignment_id": attempt.assignment_id,
+            "ticket_num": attempt.ticket_num,
+            "plan_revision": attempt.plan_revision,
+            "attempt": attempt.attempt,
+            "task_packet_hash": attempt.task_packet_hash,
+        }
+        for field, value in expected.items():
+            actual = getattr(envelope, field)
+            if actual != value:
+                raise ReceiptError(
+                    f"receipt {field} mismatch for {attempt.assignment_id}: "
+                    f"receipt={actual!r}, expected={value!r}"
+                )
+
+    def _reject_receipt(
+        self, attempt: ExecutionAttempt, claim_token: str, reason: str
+    ) -> None:
+        """Leave a bad receipt's attempt recoverable (no merge, lease freed)."""
+        try:
+            self.store.mark_execution_attempt_state(
+                attempt.assignment_id,
+                claim_token,
+                "unknown",
+                failure_code=f"receipt-invalid: {reason}",
+                release_lease=True,
+            )
+        except ExecutionAttemptError:
+            # The attempt already reached a terminal state; the caller still
+            # surfaces the rejection loudly.
+            pass
 
     def _merge_action(
         self,

@@ -33,7 +33,7 @@ cognitive state machine on the active path.
 | `scripts/orchestration/receipt.py` / `result.py` | sealed-receipt verify/seal core + `ResultEnvelope` (success evidence model) |
 | `scripts/orchestration/session_model.py` | action batch models (dispatch/recover/resolve_merge/wait/blocked/complete) + Task Packet finalization |
 | `scripts/receipt.py` | subagent-facing `verify`/`seal` CLI — the only accepted success evidence |
-| `scripts/session_control.py` | **the control-plane CLI** over `SessionController` (actions/bind/reconcile/status/cleanup) — the only adapter surface |
+| `scripts/session_control.py` | **the control-plane CLI** over `SessionController` (actions/bind/reconcile/status/cleanup/abandon) — the only adapter surface |
 | `scripts/ticket_board.py` | static HTML board generator over OpenSpec changes (zero process, zero port) |
 | `templates/` | ticket board HTML template |
 | `docs/` | design documents |
@@ -125,6 +125,6 @@ Changing fixtures requires updating assertions in tests in sync.
 - **Task / Ticket**: one `- [ ] N.M` checklist item in the change's tasks.md; num = `N*100+M`; section order defines the DAG.
 - **Assignment**: one durable attempt to execute a ticket with a native subagent (`ASG-<change>-<ticket>-r<revision>-a<attempt>`).
 - **Task Packet**: immutable per-assignment contract (goal, criteria, verification commands, worktree, claim token) — the subagent reads it and runs `receipt.py verify`/`seal`.
-- **Sealed Receipt**: the only accepted success evidence — produced after the packet's verification commands run green in the worktree on a clean, advanced HEAD.
+- **Sealed Receipt**: the only accepted success evidence — produced after the packet's verification commands run green in the worktree on a clean, advanced HEAD; its whole body is covered by `receiptHash` and verified before integration.
 - **Integration Worktree**: the shared branch where sealed assignment branches are merged serially under a repository-scoped lock (`baton-integration.lock` in the common git dir).
 - **Live Plan / Plan Revision**: tasks.md edits are picked up as new plan revisions on the next `actions()` call; the latest revision defines the scope of completion. In-flight assignments keep their immutable packets.

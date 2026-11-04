@@ -62,7 +62,9 @@ def _finish(action, marker: str) -> None:
 
 def test_parallel_pair_then_final_completes_without_lost_task(tmp_path):
     project = _project(tmp_path)
-    controller = SessionController(project, "feature")
+    controller = SessionController(
+        project, "feature", verification_commands=["test -f base.txt"]
+    )
     first = controller.actions("session-a", capacity=2)
     by_ticket = {action.ticket_num: action for action in _dispatches(first)}
     assert set(by_ticket) == {201, 202}

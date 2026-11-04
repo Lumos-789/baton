@@ -54,7 +54,15 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         project = _project(Path(tmp))
 
-        actions = _run(str(project), "demo", "actions", "--session-id", "smoke")
+        actions = _run(
+            str(project),
+            "demo",
+            "--verify",
+            "test -f README.md",
+            "actions",
+            "--session-id",
+            "smoke",
+        )
         if actions.returncode != 0:
             print(f"CLI SMOKE FAIL: actions exited {actions.returncode}\n{actions.stderr}")
             return 1

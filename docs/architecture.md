@@ -44,9 +44,16 @@ terminal event without a sealed receipt flips the attempt to `unknown` and
 returns a `recover` action. It is never silently marked successful.
 
 A sealed receipt is hash-bound local evidence (packet hash, claim-token hash,
-clean advanced HEAD, exit-0 verification results). It bounds state transitions;
-it is not a cryptographic guarantee against a subagent that edits files
-directly.
+clean advanced HEAD, exit-0 verification results). `seal` digests the whole
+envelope body — canonical JSON (sorted keys, no whitespace, `receiptHash`
+excluded) — into `receiptHash`, and `reconcile` recomputes it from the file
+*before* merging: an edited `exitCode`, `changed_files`, `commit_sha`, or any
+other field is rejected with a non-zero exit and the changed segment named. The
+receipt's ticket/assignment/revision are also checked against the attempt
+before integration, so a receipt for another ticket can never leave an attempt
+stuck in `integrating`. It bounds state transitions; it is not a cryptographic
+guarantee against a subagent that edits files directly (the digest has no
+secret).
 
 ### Why isolated worktrees solve the concurrency problem
 

@@ -18,6 +18,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 import session_control  # noqa: E402
+from orchestration.receipt import seal_receipt  # noqa: E402
 
 
 def _make_repo(tmp_path: Path) -> Path:
@@ -267,3 +268,139 @@ def test_cleanup_dry_run_previews_without_removing(tmp_path, capsys):
         "baton/real-change-tic-001-a01"
     ]
     assert wt.exists()  # preview removed nothing
+
+
+def _commit_worktree(path: Path) -> None:
+    subprocess.run(["git", "add", "-A"], cwd=path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "finish"], cwd=path, check=True, capture_output=True
+    )
+
+
+def test_cli_reconcile_tampered_receipt_exits_nonzero(tmp_path, capsys):
+    repo = _make_repo(tmp_path)
+    _add_change(repo, "real-change")
+
+    code = session_control.main(
+        [
+            str(repo),
+            "real-change",
+            "--verify",
+            "test -f a.txt",
+            "actions",
+            "--session-id",
+            "s1",
+        ]
+    )
+    assert code == 0
+    batch = json.loads(capsys.readouterr().out)
+    action = next(item for item in batch["actions"] if item["kind"] == "dispatch")
+
+    worktree = Path(action["cwd"])
+    (worktree / "done.txt").write_text("done\n", encoding="utf-8")
+    _commit_worktree(worktree)
+    seal_receipt(action["packet_path"])
+    receipt_path = Path(action["packet_path"]).with_name("receipt.json")
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["verification"][0]["exitCode"] = 1
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    code = session_control.main(
+        [
+            str(repo),
+            "real-change",
+            "reconcile",
+            action["assignment_id"],
+            action["claim_token"],
+            "--agent-terminal",
+            "completed",
+            "--session-id",
+            "s1",
+        ]
+    )
+    out = capsys.readouterr()
+    payload = json.loads(out.out)
+    assert code == 1
+    assert payload["command"] == "reconcile"
+    assert "receiptHash" in payload["error"]
+    assert "verification[0].exitCode" in payload["error"]
+    assert out.err == ""
+
+
+def test_cli_actions_without_verification_commands_fails_loud(tmp_path, capsys):
+    repo = _make_repo(tmp_path)
+    _add_change(repo, "real-change")
+
+    code = session_control.main(
+        [str(repo), "real-change", "actions", "--session-id", "s1"]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert payload["command"] == "actions"
+    assert "no verification commands configured" in payload["error"]
+
+
+def test_cli_abandon_clears_stuck_attempt_and_retry_reuses_persisted_verify(
+    tmp_path, capsys
+):
+    repo = _make_repo(tmp_path)
+    _add_change(repo, "real-change")
+    code = session_control.main(
+        [
+            str(repo),
+            "real-change",
+            "--verify",
+            "test -f a.txt",
+            "actions",
+            "--session-id",
+            "s1",
+        ]
+    )
+    assert code == 0
+    batch = json.loads(capsys.readouterr().out)
+    action = next(item for item in batch["actions"] if item["kind"] == "dispatch")
+
+    code = session_control.main(
+        [
+            str(repo),
+            "real-change",
+            "reconcile",
+            action["assignment_id"],
+            action["claim_token"],
+            "--agent-terminal",
+            "completed",
+            "--session-id",
+            "s1",
+        ]
+    )
+    assert code == 0
+    stuck = json.loads(capsys.readouterr().out)
+    assert any(item["kind"] == "recover" for item in stuck["actions"])
+
+    code = session_control.main(
+        [
+            str(repo),
+            "real-change",
+            "abandon",
+            action["assignment_id"],
+            "--reason",
+            "stuck-test",
+        ]
+    )
+    abandoned = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert abandoned["state"] == "abandoned"
+    assert abandoned["ticketNum"] == 101
+    assert "worktree" in abandoned["preserves"]
+
+    # No --verify here: the run's persisted commands must be reused.
+    code = session_control.main(
+        [str(repo), "real-change", "actions", "--session-id", "s1"]
+    )
+    retried = json.loads(capsys.readouterr().out)
+    dispatches = [item for item in retried["actions"] if item["kind"] == "dispatch"]
+    assert code == 0
+    assert [item["ticket_num"] for item in dispatches] == [101]
+    packet = json.loads(Path(dispatches[0]["packet_path"]).read_text(encoding="utf-8"))
+    assert packet["taskPacket"]["verification_commands"] == ["test -f a.txt"]

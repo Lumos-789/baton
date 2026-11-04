@@ -25,8 +25,11 @@ receipt** (the assignment's verification commands run green in an isolated
 worktree). Free-text subagent output is ignored.
 
 A sealed receipt is hash-bound evidence produced locally by `receipt.py`
-(task-packet hash + clean, advanced HEAD + exit-0 verification results). It is
-integrity evidence, not a cryptographic proof against a hostile subagent.
+(task-packet hash + clean, advanced HEAD + exit-0 verification results). The
+whole receipt body is covered by a canonical `sha256` digest (`receiptHash`),
+so an edited `exitCode`, `changed_files`, `commit_sha` or a lease claim from
+another ticket is rejected before any merge. It is integrity evidence, not a
+cryptographic proof against a hostile subagent (the digest has no secret).
 
 The change's tasks and the execution share the same granularity (one
 assignment ~ one task), and three seams are bridged deterministically:
@@ -181,7 +184,7 @@ the page.
 | `cordis.patch.yml` | DSH bundle insert row (`dsh-openspec-baton`) |
 | `.zcode-plugin/plugin.json` | ZCode plugin manifest (same skill) |
 | `skills/baton/SKILL.md` | the `baton` skill (actions -> subagent -> reconcile) |
-| `scripts/session_control.py` | the control-plane CLI (`actions`/`bind`/`reconcile`/`status`/`cleanup`) |
+| `scripts/session_control.py` | the control-plane CLI (`actions`/`bind`/`reconcile`/`status`/`cleanup`/`abandon`) |
 | `scripts/` | deterministic controller, plan store, receipts |
 
 ## History

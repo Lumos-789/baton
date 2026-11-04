@@ -81,14 +81,19 @@ required task of the change is verified and integrated.
 1. **Run the `actions` verb**:
 
    ```bash
-   <cli> "<project path>" <change-id> actions \
+   <cli> "<project path>" <change-id> --verify "<cmd>" actions \
      --session-id baton-run --capacity 1 --base-branch main
    ```
 
    Default `session_id="baton-run"` and `capacity=1`; state the chosen
-   capacity before raising it above 1. Pass change-wide verification commands
-   with `--verify "<cmd>"` before the verb when the project does not use the
-   default `git diff --check`. The result is `{ok, run_id, state, actions:[...]}`.
+   capacity before raising it above 1. The first claim **must** declare the
+   change-wide verification commands with `--verify "<cmd>"` (repeat the flag
+   for several commands): there is no implicit `git diff --check` fallback —
+   an unconfigured run fails loud. The commands are persisted with the run, so
+   every later packet (including ones prepared by `reconcile`) uses the same
+   commands even when that call omits `--verify`; passing `--verify` again is
+   an explicit override for new packets. The result is
+   `{ok, run_id, state, actions:[...]}`.
 
 2. **Handle every action in the batch**:
    - `dispatch` -> call `subagent(prompt=action.prompt,
@@ -107,8 +112,11 @@ required task of the change is verified and integrated.
      Reconcile when it finishes.
    - `wait` -> nothing to spawn; end the turn and wait for the outstanding
      completion notices.
-   - `recover` -> the attempt's outcome is unknown (no sealed receipt).
-     Surface it and decide whether to retry or repair. Never mark it
+   - `recover` -> the attempt's outcome is unknown (no sealed receipt). A
+     `lease-expired` recovery is retried automatically: the next claim replaces
+     the stale attempt and the old one is marked `superseded`, so it never
+     blocks the frontier. Any other recovery needs a decision: retry/repair or,
+     if the attempt is stuck, use `abandon` (see Cleanup). Never mark it
      succeeded.
    - `blocked` -> report the block code and reason; nothing to spawn.
    - `complete` -> every required ticket has a verified, integrated receipt.
@@ -129,7 +137,14 @@ required task of the change is verified and integrated.
    Reconcile honors only a sealed receipt written by
    `<baton-root>/scripts/receipt.py verify` / `seal` in the assignment
    worktree; a terminal event without one flips the attempt to `unknown` and
-   returns a `recover` action.
+   returns a `recover` action. The flag is not needed here: the run's
+   verification commands were persisted on the first claim (repeating
+   `--verify` would override them for later packets). A receipt whose body no
+   longer matches its sealed `receiptHash` is rejected with a non-zero exit —
+   including `verification[*].exitCode`, `changed_files`, `commit_sha` and a
+   ticket/assignment that does not belong to this attempt. Nothing is merged
+   for a rejected receipt; the attempt becomes `unknown` and the ticket stays
+   unresolved.
 
 4. **Process the action batch returned by `reconcile` directly.** Call
    `actions` again only when starting a run or resuming after a restart.
@@ -187,6 +202,21 @@ the matched worktrees (`wouldRemove`) without removing anything. A change-id
 that never ran (typo) fails with `no baton worktrees or branches found`
 instead of an empty success.
 
+### Abandon a stuck attempt (operator escape)
+
+```bash
+<cli> "<project path>" <change-id> abandon <assignment_id> [--reason "<why>"]
+```
+
+Use this when an attempt can no longer make progress (for example a `recover`
+that is not a retryable `lease-expired`, or a receipt rejected as tampered).
+It **destroys** the attempt's lease and its eligibility for reconcile — any
+later receipt from that assignment is ignored. It **preserves** the assignment
+worktree, branch, commits, packet and receipt on disk for audit; it does not
+revert or merge anything. After the abandon, the ticket is claimable again on
+the next `actions` call (a fresh attempt id and worktree). The command prints
+`destroys` / `preserves` fields so the consequence is explicit.
+
 ## OpenSpec change -> ticket mapping
 
 ```markdown
@@ -207,8 +237,8 @@ instead of an empty success.
 - `[x]` = resolved, `[ ]` = ready; there is no draft state
 - **DAG**: task `N.M` is blocked by every task in earlier sections; tasks
   within a section are independent (parallel frontier)
-- verification: the change-wide `--verify` CLI flag
-  (default `git diff --check`)
+- verification: the change-wide `--verify` CLI flag, persisted with the run on
+  the first claim (no implicit default; an unconfigured run fails loud)
 - write-back: an integrated receipt flips the checkbox to `[x]` in `tasks.md`
 
 See `<baton-root>/docs/ticket-format.md` for the exact parsing rules.
@@ -294,19 +324,28 @@ Check progress at any time with
 
 - **Frontier empty**: check `tasks.md` - are the target task's section
   predecessors all `[x]`? Is the task itself unchecked?
-- **An attempt is `unknown`**: the subagent finished without a sealed receipt.
-  Reconcile surfaced a `recover` action; retry or repair, never assume
-  success.
+- **An attempt is `unknown`**: the subagent finished without a sealed receipt,
+  or its lease expired. A `lease-expired` recovery is retried automatically and
+  the stale attempt becomes `superseded`. Any other `recover` needs a decision:
+  retry/repair, or `abandon <assignment_id>` if it cannot progress. Never
+  assume success.
+- **`actions`/`reconcile` exits non-zero with `receiptHash`**: the sealed
+  receipt's body was edited on disk (or written by an older baton). Nothing was
+  merged. Re-seal from the assignment worktree, or `abandon` the attempt and
+  let the next `actions` claim a fresh one.
 - **A `resolve_merge` action appeared**: two assignments touched overlapping
   files; the conflict is preserved in the integration worktree. Resolve it in
   a subagent, then reconcile again.
 - **`capacity > 5` rejected**: the controller caps concurrency at 5.
 - **Sealed receipt != semantic correctness**: a sealed receipt binds the
-  packet hash, a clean advanced HEAD, and exit-0 verification commands into a
-  JSON file. It is integrity evidence produced by `receipt.py`, not a
-  cryptographic proof that a subagent cannot forge local files - pass strong
+  packet hash, the claim token, a clean advanced HEAD, the exit codes and the
+  changed-file list into one JSON file, and covers the whole body with a
+  canonical `sha256` digest (`receiptHash`). It is integrity evidence produced
+  by `receipt.py`, not a cryptographic proof that a subagent cannot forge
+  local files (the digest has no secret) - pass strong
   `verification_commands` and still review destructive outcomes.
 - **Per-task verification**: verification is change-wide via the `--verify`
-  CLI flag; `tasks.md` carries no per-task override.
+  CLI flag, persisted on the first claim; `tasks.md` carries no per-task
+  override.
 - **tasks.md changed mid-run**: fine - the next `actions` call records a new
   plan revision; in-flight packets stay immutable.

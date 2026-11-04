@@ -1,0 +1,23 @@
+# Python caches — never ship bytecode. Keep this explicit instead of relying on
+# npm's .gitignore fallback, so a package can never contain __pycache__/*.pyc.
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local / runtime state
+.git/
+.dsh/
+.agents/
+.idea/
+.vscode/
+logs/
+node_modules/
+.DS_Store
+
+# Secrets / credentials — never ship (mirrors .gitignore)
+*.env
+.env
+.env.*
+notify.json
+*_key.json
+secrets.json

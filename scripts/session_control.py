@@ -28,7 +28,7 @@ def _controller(args: argparse.Namespace) -> SessionController:
     return SessionController(
         args.project,
         args.feature,
-        verification_commands=args.verify or None,
+        verification_commands=args.verify,
     )
 
 
@@ -90,7 +90,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Baton session control")
     parser.add_argument("project")
     parser.add_argument("feature")
-    parser.add_argument("--verify", action="append")
+    parser.add_argument(
+        "--verify",
+        action="append",
+        help="verification command; the first claim persists it for the run "
+        "(repeatable). Passing it again overrides the stored commands for new "
+        "packets. Required until a run has commands configured.",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     actions = sub.add_parser("actions")
@@ -137,6 +143,19 @@ def main(argv: list[str] | None = None) -> int:
         help="preview: list the worktrees cleanup would remove, remove nothing",
     )
 
+    abandon = sub.add_parser(
+        "abandon",
+        help="operator escape hatch: retire a stuck attempt (releases its lease, "
+        "ignores future receipts); it does NOT delete the worktree, branch, "
+        "commits, packet or receipt",
+    )
+    abandon.add_argument("assignment_id")
+    abandon.add_argument(
+        "--reason",
+        default="operator-abandoned",
+        help="recorded in the attempt's failure_code / event log",
+    )
+
     args = parser.parse_args(argv)
     try:
         if args.command == "cleanup":
@@ -158,6 +177,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.command == "status":
             result = controller.status()
+        elif args.command == "abandon":
+            result = controller.abandon(args.assignment_id, reason=args.reason)
         else:
             result = controller.reconcile(
                 args.assignment_id,

@@ -14,9 +14,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 from orchestration.model import TaskPacket  # noqa: E402
 from orchestration.receipt import (  # noqa: E402
     ReceiptError,
+    compute_receipt_hash,
     seal_receipt,
     shell_command,
     verify_packet,
+    verify_receipt_body,
 )
 from orchestration.session_model import finalize_task_packet  # noqa: E402
 
@@ -146,3 +148,36 @@ def test_receipt_write_is_atomic_and_idempotent(tmp_path):
     assert on_disk["status"] == "succeeded"
     assert on_disk["commit_sha"] == first.commit_sha
     assert not Path(payload["receiptPath"] + ".tmp").exists()
+
+
+def test_seal_hashes_the_whole_receipt_body(tmp_path):
+    project, packet, payload = _setup(tmp_path)
+    (project / "changed.txt").write_text("done")
+    _git(project, "add", "-A")
+    _git(project, "commit", "-m", "done")
+
+    seal_receipt(packet)
+    on_disk = json.loads(Path(payload["receiptPath"]).read_text())
+
+    assert on_disk["receiptHash"] == compute_receipt_hash(on_disk)
+    assert {"commit_sha", "changed_files.length", "verification[0].exitCode"} <= set(
+        on_disk["receiptSegments"]
+    )
+    # The digest covers the envelope body; the segment table only names the edit.
+    tampered = json.loads(json.dumps(on_disk))
+    tampered["verification"][0]["exitCode"] = 1
+    with pytest.raises(ReceiptError, match=r"verification\[0\]\.exitCode"):
+        verify_receipt_body(tampered)
+
+
+def test_receipt_without_body_digest_is_rejected(tmp_path):
+    project, packet, payload = _setup(tmp_path)
+    (project / "changed.txt").write_text("done")
+    _git(project, "add", "-A")
+    _git(project, "commit", "-m", "done")
+    seal_receipt(packet)
+    on_disk = json.loads(Path(payload["receiptPath"]).read_text())
+    legacy = {k: v for k, v in on_disk.items() if k != "receiptHash"}
+
+    with pytest.raises(ReceiptError, match="not sealed"):
+        verify_receipt_body(legacy)

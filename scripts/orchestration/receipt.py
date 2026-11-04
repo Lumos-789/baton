@@ -18,6 +18,127 @@ class ReceiptError(RuntimeError):
     """The assignment cannot produce a trusted receipt."""
 
 
+RECEIPT_HASH_FIELD = "receiptHash"
+RECEIPT_SEGMENTS_FIELD = "receiptSegments"
+
+
+def canonical_receipt_json(body: dict[str, Any]) -> str:
+    """Serialize a receipt body canonically for digesting.
+
+    The canonical form is ``json.dumps`` with sorted object keys at every
+    level, no insignificant whitespace (``separators=(",", ":")``) and
+    ``ensure_ascii=False`` so the digest covers the same bytes regardless of
+    how a writer escapes non-ASCII text. Only the ``receiptHash`` field is
+    excluded; every other field (including ``receiptSegments``) is covered.
+    """
+    return json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def compute_receipt_hash(receipt: dict[str, Any]) -> str:
+    """Return ``sha256`` over the canonical body, excluding ``receiptHash``."""
+    body = {key: value for key, value in receipt.items() if key != RECEIPT_HASH_FIELD}
+    return hashlib.sha256(canonical_receipt_json(body).encode("utf-8")).hexdigest()
+
+
+def _segment_digest(value: Any) -> str:
+    payload = value if isinstance(value, str) else canonical_receipt_json(value)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def compute_receipt_segments(receipt: dict[str, Any]) -> dict[str, str]:
+    """Return per-field digests used to name the segment a tamper touched.
+
+    These digests are only a diagnostic aid: the authoritative integrity
+    check is :func:`compute_receipt_hash` over the whole body (which includes
+    this table). Listing every top-level field, every list element and every
+    verification-result field lets a rejected receipt report e.g.
+    ``verification[0].exitCode`` instead of "something changed".
+    """
+    segments: dict[str, str] = {}
+    for key in sorted(receipt):
+        if key in {RECEIPT_HASH_FIELD, RECEIPT_SEGMENTS_FIELD}:
+            continue
+        value = receipt[key]
+        if isinstance(value, list):
+            segments[f"{key}.length"] = _segment_digest(len(value))
+            for index, item in enumerate(value):
+                if isinstance(item, dict):
+                    for subkey in sorted(item):
+                        segments[f"{key}[{index}].{subkey}"] = _segment_digest(
+                            item[subkey]
+                        )
+                else:
+                    segments[f"{key}[{index}]"] = _segment_digest(item)
+        else:
+            segments[key] = _segment_digest(value)
+    return segments
+
+
+def verify_receipt_body(receipt: dict[str, Any], *, source: str = "receipt") -> None:
+    """Recompute the receipt digest from disk and reject any mismatch.
+
+    Raises:
+        ReceiptError: the receipt predates sealing (no ``receiptHash``) or its
+            body no longer matches the digest. The message names the changed
+            segment(s) when the (sealed) segment table can still tell.
+    """
+    stored = receipt.get(RECEIPT_HASH_FIELD)
+    if not isinstance(stored, str) or not stored:
+        raise ReceiptError(
+            f"{source} is not sealed: missing {RECEIPT_HASH_FIELD} "
+            "(re-seal it with `receipt.py seal`)"
+        )
+    actual = compute_receipt_hash(receipt)
+    if stored == actual:
+        return
+    changed: list[str] = []
+    stored_segments = receipt.get(RECEIPT_SEGMENTS_FIELD)
+    if isinstance(stored_segments, dict):
+        current = compute_receipt_segments(receipt)
+        changed = sorted(
+            key
+            for key in set(current) | set(stored_segments)
+            if current.get(key) != stored_segments.get(key)
+        )
+    if changed:
+        detail = "changed segment(s): " + ", ".join(changed[:8])
+        if len(changed) > 8:
+            detail += f" (+{len(changed) - 8} more)"
+    else:
+        detail = (
+            "no segment digest pins the edit "
+            f"(the {RECEIPT_HASH_FIELD} or {RECEIPT_SEGMENTS_FIELD} table was rewritten)"
+        )
+    raise ReceiptError(
+        f"{source} body digest mismatch: {detail}; "
+        f"stored {RECEIPT_HASH_FIELD}={stored[:12]}..., recomputed={actual[:12]}..."
+    )
+
+
+def verify_sealed_receipt(
+    receipt: dict[str, Any],
+    *,
+    claim_token: str,
+    task_packet_hash: str = "",
+) -> ResultEnvelope:
+    """Verify a receipt read from disk and return its envelope.
+
+    Checks the body digest first (so an edited ``exitCode``/``changed_files``/
+    ``commit_sha`` is rejected before anything is integrated), then the claim
+    token hash and, when given, the task packet hash.
+    """
+    verify_receipt_body(receipt, source="sealed receipt")
+    expected_token_hash = hashlib.sha256(claim_token.encode("utf-8")).hexdigest()
+    if receipt.get("claimTokenHash") != expected_token_hash:
+        raise ReceiptError("sealed receipt claim token mismatch")
+    if task_packet_hash and receipt.get("task_packet_hash") != task_packet_hash:
+        raise ReceiptError("sealed receipt task packet hash mismatch")
+    try:
+        return ResultEnvelope.from_dict(receipt)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ReceiptError(f"malformed sealed receipt: {exc}") from exc
+
+
 def shell_command(command: str, *, platform: str | None = None) -> list[str]:
     """Wrap a verification command in the platform's bootstrap shell."""
     name = os.name if platform is None else platform
@@ -176,8 +297,21 @@ def seal_receipt(packet_path: str | Path) -> ResultEnvelope:
     receipt["claimTokenHash"] = hashlib.sha256(
         str(payload["claimToken"]).encode("utf-8")
     ).hexdigest()
+    receipt[RECEIPT_SEGMENTS_FIELD] = compute_receipt_segments(receipt)
+    receipt[RECEIPT_HASH_FIELD] = compute_receipt_hash(receipt)
     _atomic_json(_receipt_path(payload, path), receipt)
     return envelope
 
 
-__all__ = ["ReceiptError", "seal_receipt", "verify_packet"]
+__all__ = [
+    "RECEIPT_HASH_FIELD",
+    "RECEIPT_SEGMENTS_FIELD",
+    "ReceiptError",
+    "canonical_receipt_json",
+    "compute_receipt_hash",
+    "compute_receipt_segments",
+    "seal_receipt",
+    "verify_packet",
+    "verify_receipt_body",
+    "verify_sealed_receipt",
+]

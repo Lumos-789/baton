@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.3.1 (2026-11-05)
+
+Five release blockers found by an extended verification round. The sealed
+receipt, the lease state machine, the verification configuration and receipt
+identity are now enforced by the controller instead of documented only.
+
+- **The sealed receipt is actually tamper-evident.** `seal` now digests the
+  whole envelope body (canonical JSON: sorted keys, no whitespace,
+  `receiptHash` excluded) into `receiptHash` and records a `receiptSegments`
+  table for diagnostics. `reconcile` recomputes the digest from the file
+  before integration and rejects edits to `verification[*].exitCode`,
+  `changed_files`, `commit_sha` or any other field with a non-zero exit that
+  names the changed segment. Receipts sealed by 0.3.0 lack the digest and are
+  rejected as unsealed — re-seal the worktree, or abandon the attempt.
+- **An expired lease no longer deadlocks the run.** Expired attempts are
+  retired before a batch is planned, a retry replaces the stale attempt (which
+  is marked `superseded`) instead of being re-dispatched, and a superseded
+  attempt stops emitting `recover`. The frontier advances to later tickets.
+  New operator escape: `session_control.py <project> <change> abandon
+  <assignment_id>` retires a stuck attempt, prints exactly what it destroys
+  (the lease and future reconciliation) and what it preserves (worktree,
+  branch, commits, packet, receipt), and makes the ticket claimable again.
+- **`--verify` is persisted with the run.** The first claim stores the
+  change-wide verification commands in the plan store; every later packet
+  (including ones prepared by `reconcile` without the flag) reuses them. No
+  commands configured is now a loud failure instead of a silent
+  `git diff --check` downgrade. Passing `--verify` again is an explicit
+  override for new packets.
+- **A wrong-ticket receipt is rejected before the merge.** `reconcile`
+  validates the receipt's `ticket_num`, `assignment_id`, `plan_revision`,
+  `attempt` and packet hash against the attempt before touching the
+  integration branch. A mismatch leaves the attempt `unknown` (not stuck in
+  `integrating`) and the ticket unresolved.
+- **Release hygiene.** `.npmignore` explicitly excludes `__pycache__/` and
+  `*.pyc` (npm no longer relies on the `.gitignore` fallback); packaging tests
+  assert no bytecode is tracked or packed and that the orchestration modules
+  still import after the queue module moved out.
+
+Regression: `./tests/regression.sh` — 172 passed, 5/5 stages green.
+
 ## 0.3.0 (2026-11-04)
 
 Baton is one product again: the ticket/DAG control plane. Two things that were

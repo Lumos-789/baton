@@ -52,7 +52,7 @@ feature; a task is a ticket.
 | `[x]` checked | status `resolved` |
 | task text | title / what-to-build / single acceptance criterion |
 | (none) | draft — an unapproved change is simply not run |
-| (none) | per-task `Verify:` override — verification is change-wide via the CLI `--verify` flag (default `git diff --check`) |
+| (none) | per-task `Verify:` override — verification is change-wide via the CLI `--verify` flag, persisted with the run on the first claim (no implicit default; an unconfigured run fails loud) |
 
 ### Dependency semantics (section-order DAG)
 
