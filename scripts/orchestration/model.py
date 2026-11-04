@@ -2,10 +2,9 @@
 
 These dataclasses describe the *agent* side of Baton's orchestration layer:
 who an Agent is (``AgentProfile``), what work we hand them (``TaskPacket``),
-and the running record of a dispatch (``Assignment``). They are intentionally
-separate from the resource-scheduling kernel in ``coordination/model.py``
-(Job/StageSpec/ResourceDef) — that layer models *what* runs, this layer
-models *who* runs it.
+and the running record of a dispatch (``Assignment``). They model *who* runs
+the work; the resource queue that used to sit alongside them now lives
+outside this repository and is not imported here.
 
 The structured receipt returned by an agent is reused verbatim from
 ``orchestration/result.py`` (``ResultEnvelope``) — it is **not** redefined

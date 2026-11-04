@@ -1,7 +1,7 @@
 ---
 name: baton
 description: baton 接力调度——用确定性 ticket/DAG 控制面执行已批准的 OpenSpec change。当用户说「跑 baton」「跑一下 baton」「baton status」「用 baton 排活」「派活」「派发任务」「把这个 OpenSpec change 跑完」或问 baton 能不能排活时使用；本地 CLI 返回确定 actions，会话派发给隔离 worktree 子代理，验证全绿的密封回执才算完成。Also use when the user says "run baton", "baton status", or wants an OpenSpec change executed with verified integration.
-whenToUse: The user mentions baton in any phrasing (跑 baton / baton status / 排活 / 派活 / dispatch) or wants an approved OpenSpec change executed, inspected, or queued in a git project.
+whenToUse: The user mentions baton in any phrasing (跑 baton / baton status / 排活 / 派活 / dispatch) or wants an approved OpenSpec change executed or inspected in a git project.
 ---
 
 # Baton
