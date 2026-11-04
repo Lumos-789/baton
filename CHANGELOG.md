@@ -38,7 +38,8 @@ identity are now enforced by the controller instead of documented only.
   assert no bytecode is tracked or packed and that the orchestration modules
   still import after the queue module moved out.
 
-Regression: `./tests/regression.sh` — 172 passed, 5/5 stages green.
+Regression: `./tests/regression.sh` — 156 passed, 5/5 stages green (the 16 that
+went away were exclusive to the deleted queue/worktree/topo-sort surface).
 
 ### Simplification pass (same unreleased version)
 
@@ -54,6 +55,16 @@ Regression: `./tests/regression.sh` — 172 passed, 5/5 stages green.
   walkthrough were all second copies. Every removed section is now a pointer.
 - Leases are documented: fixed **7200 s**, no renewal entry point, so a ticket
   longer than two hours always returns `lease-expired` and is re-dispatched.
+- ~1340 lines of dead code removed, every deletion pre-verified as zero-call:
+  the local resource queue that moved out in 0.3.0 left six public methods,
+  nine helpers and two tables behind; the pre-0.3.0 worker API in `worktree.py`
+  was superseded by the assignment worktrees; `model.py` still carried eight
+  symbols from the retired agent-profile model; and `topo_sort`, `plan_history`,
+  `record_assignment`, `heartbeat_execution_attempt` and `record_result_envelope`
+  had no callers at all. `attempt_resource_leases` (the live path) is untouched.
+- `README_CN.md` caught up with 0.3.1 (receiptHash, abandon, persisted `--verify`,
+  plus the History and Requirements sections) and `tests/check_docs.py` now
+  covers README_CN, architecture and ticket-format, so the next drift fails CI.
 
 ## 0.3.0 (2026-11-04)
 
