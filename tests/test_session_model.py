@@ -55,8 +55,6 @@ def test_dispatch_action_contains_host_neutral_prompt_and_cwd():
         claim_token="token",
         packet_path="/abs/packet.json",
         task_packet_hash="abc",
-        model="gpt-5.6-terra",
-        reasoning_effort="high",
     )
 
     data = action.to_dict()

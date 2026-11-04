@@ -55,6 +55,16 @@ stuck in `integrating`. It bounds state transitions; it is not a cryptographic
 guarantee against a subagent that edits files directly (the digest has no
 secret).
 
+### Why leases are fixed at 7200 s
+
+A claim's lease is hardcoded to **7200 s (2 h)** — there is no CLI flag and no
+renewal entry point. `expire_execution_attempts()` runs before every batch: an
+attempt whose lease ran out is marked `unknown` with
+`failure_code=lease-expired`, and its ticket is claimable again on that same
+`actions()` call (the retry supersedes the stale attempt). A ticket that
+legitimately needs longer than two hours therefore always surfaces as
+`lease-expired` and is re-dispatched instead of silently deadlocking.
+
 ### Why isolated worktrees solve the concurrency problem
 
 Each assignment gets its own branch + worktree
@@ -90,15 +100,18 @@ session_controller.py ──→ plan_store.py (durable: queue.db)
    │   │   └──→ integrator.py ──→ worktree.py (git)
    │   └──────→ receipt.py (verify/seal — the subagent CLI)
    └──────────→ session_model.py (action/attempt contracts)
-plan_store.py ──→ _ticket.py (OpenSpec tasks.md parser) + _frontier.py (DAG frontier)
+plan_store.py ──→ _ticket.py (OpenSpec tasks.md parser)
+ticket_board.py ──→ _frontier.py (DAG frontier, observability only)
 session_control.py ──→ session_controller.py (thin CLI adapter)
 ```
 
 - `plan_store.py`: durable plan store (`queue.db`) — plan revisions (synced
   from tasks.md edits), execution attempts, leases, sealed receipts,
   completion facts.
-- `_ticket.py` + `_frontier.py`: OpenSpec tasks.md parsing + DAG frontier (the
-  read side the controller uses to decide what is claimable).
+- `_ticket.py`: OpenSpec tasks.md parsing — the ticket source the plan store
+  reads on every sync.
+- `_frontier.py`: DAG frontier — used by `ticket_board.py` to label claimable
+  cards; the controller claims through `plan_store.py` instead.
 
 ## Why the plan face is OpenSpec tasks.md
 
@@ -119,5 +132,6 @@ See [ticket-format.md](ticket-format.md) for the exact parsing rules.
 - **v1** — external `ralph.sh` bash loop spawning headless `zcode -p`.
 - **v2** — loop moved into Python (`SerialExecutor`/`ParallelExecutor`), still headless subprocesses.
 - **v3** — subprocesses replaced by subagents, but coordination used a shared PRD + `passes:true` flags. This caused overwrite-induced ticket loss, batches mis-marked complete, and double-writes.
-- **v4** — `SessionController` is the sole deterministic scheduler. No PRD, no `passes` flags, isolated worktrees, sealed receipts, capacity-≤3 sliding window. Ralph permanently retired.
-- **v5 (current)** — OpenSpec is the single plan face: tasks.md is the ticket source, the self-built cognitive layer (CompleteFlow/Grill/Brief/Planner/Approval) and the amendment engine are retired, and live-plan edits are plain tasks.md edits picked up as new plan revisions.
+- **v4** — `SessionController` is the sole deterministic scheduler. No PRD, no `passes` flags, isolated worktrees, sealed receipts, capacity-≤3 sliding window (3 was the cap at the time; the whole repository is ≤5 now). Ralph permanently retired.
+- **v5** — OpenSpec is the single plan face: tasks.md is the ticket source, the self-built cognitive layer (CompleteFlow/Grill/Brief/Planner/Approval) and the amendment engine are retired, and live-plan edits are plain tasks.md edits picked up as new plan revisions.
+- **v6 (current)** — the local MCP adapter is dropped: the CLI is the only control surface while the plugin is still iterating (same history as README.md).

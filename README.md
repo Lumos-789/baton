@@ -148,6 +148,14 @@ SessionController (the sole deterministic scheduler)
 - **Sealed receipts** - `scripts/receipt.py verify` / `seal` is the only
   accepted success evidence; a completion notice without a receipt flips the
   attempt to `unknown`.
+- **Fixed 7200 s leases** - a claim's lease is hardcoded to 7200 s (2 h): there
+  is no CLI flag and no renewal entry point. A lease that runs out is judged
+  `lease-expired` (the attempt flips to `unknown` with that `failure_code`) and
+  the ticket is re-dispatched by the next `actions` call.
+- **Operator escape hatch** - `abandon <assignment_id>` retires a stuck
+  attempt: it releases the lease and drops the attempt's eligibility for
+  reconcile, while its worktree, branch, commits, packet and receipt stay on
+  disk for audit.
 
 **Control plane**:
 - **OpenSpec-native cognitive phase** - "use baton to finish X" means the
@@ -157,6 +165,10 @@ SessionController (the sole deterministic scheduler)
 - **Live plan = edit tasks.md** - add tasks or sections at runtime; the next
   `actions()` call records a new plan revision and the frontier is recomputed.
   In-flight packets stay immutable.
+- **Verification is change-wide and persisted** - `--verify "<cmd>"` (top-level,
+  repeatable) is persisted with the run on the first claim, so later packets -
+  including ones prepared by `reconcile` - reuse it; passing it again is an
+  explicit override. There is no per-task verification override.
 
 **Observability**: `scripts/ticket_board.py` produces a pure static HTML
 Kanban board over a project's OpenSpec changes (zero process, zero port,

@@ -67,7 +67,6 @@ class Ticket:
         blocked_by: nums of all tasks in earlier sections.
         status: ready (unchecked) / resolved (checked).
         criteria: single criterion — the task text itself.
-        verify: empty; feature-level verification_commands apply.
         file_path: path to tasks.md (used for write-back).
         section: title of the section the task lives in.
     """
@@ -78,7 +77,6 @@ class Ticket:
     blocked_by: list[int] = field(default_factory=list)
     status: str = "ready"
     criteria: list[tuple[bool, str]] = field(default_factory=list)
-    verify: list[str] = field(default_factory=list)
     file_path: str = ""
     section: str = ""
 
@@ -166,7 +164,6 @@ def parse_tasks_md(path: str | Path) -> list[Ticket]:
             blocked_by=list(blocked_by_section[sec]),
             status="resolved" if done else "ready",
             criteria=[(done, text)],
-            verify=[],
             file_path=str(path),
             section=section_titles[sec],
         )

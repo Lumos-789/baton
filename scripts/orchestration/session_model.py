@@ -68,8 +68,6 @@ class DispatchAction(BaseAction):
     claim_token: str
     packet_path: str
     task_packet_hash: str
-    model: str = ""
-    reasoning_effort: str = ""
 
 
 @dataclass

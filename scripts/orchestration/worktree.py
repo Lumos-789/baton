@@ -9,38 +9,36 @@ editing the same working tree at the same time").
 git worktree is git's native parallel-development mechanism: multiple
 independent working trees are attached under the **same repository**, each
 checking out its own branch, sharing the ``.git`` object store while the
-working trees stay isolated. This is exactly what "N workers developing the
-same project in parallel" needs:
+working trees stay isolated. This is what "N assignments developing the same
+project in parallel" needs:
 
-    main repo/
-    ├── .git/                    ← shared object store
-    ├── src/...                   ← main working tree (worker 0, or serial mode)
-    └── ../<project>-w<ticket>/   ← worker 1's independent working tree
-        └── src/...               ← each checks out its own branch, no stomping
+    main repo/                                      ← never checked out/switched
+    ├── .git/                                       ← shared object store
+    └── ../<project>-baton-<change>-tic-2-a01/      ← one assignment
+        └── src/...                                 ← own branch, no stomping
 
-This module provides worktree lifecycle management: prepare (create + branch),
-remove (cleanup), list (enumerate). It **never touches** uncommitted changes
-in the main working tree (red line: "never discard the worktree") — a worktree
-is a new checkout, not an overwrite.
+This module provides the primitives the controller drives: one isolated
+worktree per assignment (``prepare_assignment_worktree``), the shared
+integration worktree (``prepare_integration_worktree``), and
+``cleanup_feature_worktrees`` for disk hygiene once a run completes. It
+**never touches** uncommitted changes in the main working tree (red line:
+"never discard the worktree") — a worktree is a new checkout, not an
+overwrite.
 
 Design decisions:
 - Worktrees are attached in a **sibling directory of the project**
-  (``../<project>-w<ticket>/``), not inside the project, to avoid polluting
-  ``.gitignore`` and being swept up by ``git add -A``.
-- Branch name is ``baton/<feature>-w<worker_id>``, created from ``main`` (or a
-  specified base branch).
+  (``../<project>-baton-<change>-...``), not inside the project, to avoid
+  polluting ``.gitignore`` and being swept up by ``git add -A``.
+- Assignment branches are ``baton/<change>-tic-<ticket>-a<attempt>``, created
+  from the integration branch ``baton/<change>``.
 - Worktree creation failure (branch exists, path occupied, not a git repo)
   **raises an exception** rather than failing silently — in parallel execution
-  a worktree that did not come up must surface to the caller; a worker must
-  never sneak back into the main working tree (that would break the isolation
-  guarantee).
+  a worktree that did not come up must surface to the caller.
 """
 
 from __future__ import annotations
 
-import os
 import re
-import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,7 +55,8 @@ class WorktreeSlot:
     ``path`` is the worktree's absolute path (the agent edits code here);
     ``branch`` is the branch this worktree checks out;
     ``main_repo`` is the main repository root (where the shared ``.git`` lives);
-    ``worker_id`` identifies the owning worker (w0/w1/...).
+    ``worker_id`` names the slot owner (``integration-<change>`` or
+    ``tic-<ticket>-a<attempt>``).
     """
 
     path: Path
@@ -108,31 +107,6 @@ def _is_git_repo(path: Path) -> bool:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
     return result.returncode == 0 and result.stdout.strip() == "true"
-
-
-def worktree_path(project_path: Path, worker_id: str) -> Path:
-    """Compute the worktree path for a worker.
-
-    Placed in a **sibling directory of the project**: ``<project>-<worker_id>``
-    (worker_id looks like ``w0`` / ``w1`` and already includes the ``w``
-    prefix). The main working tree (worker_id="main" or empty) does not get a
-    worktree — it uses the project itself.
-    """
-    project_path = Path(project_path).resolve()
-    if worker_id in ("", "main"):
-        return project_path
-    return project_path.parent / f"{project_path.name}-{worker_id}"
-
-
-def worktree_branch(feature: str, worker_id: str) -> str:
-    """The branch name for a worker: ``baton/<feature>-<worker_id>``.
-
-    worker_id looks like ``w0`` / ``w1`` (already includes the ``w``), so the
-    branch is ``baton/feat-x-w0``, not ``baton/feat-x-ww0``.
-    """
-    if worker_id in ("", "main"):
-        return f"baton/{feature}"
-    return f"baton/{feature}-{worker_id}"
 
 
 def _safe_component(value: str) -> str:
@@ -230,11 +204,6 @@ def prepare_assignment_worktree(
     )
 
 
-def worktree_is_clean(path: str | Path) -> bool:
-    result = _run_git(["status", "--porcelain"], cwd=str(Path(path).resolve()))
-    return not (result.stdout or "").strip()
-
-
 def branch_is_merged(repo_path: str | Path, branch: str, target: str) -> bool:
     try:
         _run_git(
@@ -244,195 +213,6 @@ def branch_is_merged(repo_path: str | Path, branch: str, target: str) -> bool:
         return True
     except WorktreeError:
         return False
-
-
-def prepare_worktree(
-    project_path: str | Path,
-    feature: str,
-    worker_id: str,
-    *,
-    base_branch: str = "main",
-) -> WorktreeSlot:
-    """Prepare an independent worktree + branch for a worker.
-
-    Idempotent: if the worktree path is already a correct checkout on the right
-    branch, it returns directly (no error). Otherwise it creates the branch
-    from ``base_branch`` and attaches the worktree.
-
-    Args:
-        project_path: main repository root (must be a git repo).
-        feature: the baton feature name (a branch path component).
-        worker_id: worker identifier (w0/w1/...); ``"main"`` or empty → no
-            worktree is created and the main working tree itself is returned
-            (for serial mode).
-        base_branch: the branch the worktree branch is created from (default main).
-
-    Returns:
-        :class:`WorktreeSlot`; ``path`` is the working area the agent should
-        work in.
-
-    Raises:
-        WorktreeError: not a git repo / branch exists but is not based on base
-            / path occupied by something other than a worktree / git command
-            failed.
-    """
-    project = Path(project_path).resolve()
-
-    # Serial mode: worker_id="main" → no worktree, return the main working tree directly.
-    if worker_id in ("", "main"):
-        if not _is_git_repo(project):
-            raise WorktreeError(f"main working tree is not a git repo: {project}")
-        return WorktreeSlot(
-            path=project,
-            branch=worktree_branch(feature, worker_id),
-            main_repo=project,
-            worker_id="main",
-        )
-
-    if not _is_git_repo(project):
-        raise WorktreeError(f"project is not a git repo: {project}")
-
-    wt_path = worktree_path(project, worker_id)
-    branch = worktree_branch(feature, worker_id)
-
-    # Worktree already exists: verify it is on the right branch; reuse if so.
-    if wt_path.exists() and _is_git_repo(wt_path):
-        existing_branch = _current_branch(wt_path)
-        if existing_branch == branch:
-            return WorktreeSlot(
-                path=wt_path, branch=branch, main_repo=project, worker_id=worker_id
-            )
-        # Path present but wrong branch — do not force-overwrite (red line: never discard the worktree).
-        raise WorktreeError(
-            f"worktree path {wt_path} already exists but checks out {existing_branch}, "
-            f"expected {branch}. Please clean it up manually and retry."
-        )
-
-    # Create the branch (if absent), then attach the worktree to it.
-    branch_exists = _branch_exists(project, branch)
-    if branch_exists:
-        # Branch exists → check it out into this worktree.
-        _run_git(
-            ["worktree", "add", str(wt_path), branch],
-            cwd=str(project),
-        )
-    else:
-        # Branch does not exist → worktree add -b creates the branch and attaches the worktree in one step.
-        _run_git(
-            ["worktree", "add", "-b", branch, str(wt_path), base_branch],
-            cwd=str(project),
-        )
-
-    return WorktreeSlot(
-        path=wt_path, branch=branch, main_repo=project, worker_id=worker_id
-    )
-
-
-def remove_worktree(slot: WorktreeSlot, *, force: bool = False) -> bool:
-    """Clean up a worktree.
-
-    Runs ``git worktree remove`` — a safe delete (git checks whether the
-    working tree is clean). ``force=True`` forces the delete (it deletes even
-    with uncommitted changes) — **use with care**: the red line says never
-    discard the worktree, so the default is ``force=False``; a dirty working
-    tree raises an error so a human can intervene.
-
-    The branch is **not deleted** (the ``baton/<feature>-w<id>`` branch is
-    kept for later merge or review).
-
-    The main working tree (worker_id="main") is not deleted (it is the project
-    itself).
-
-    Returns:
-        True if the worktree was deleted; False if it no longer exists or is
-        the main working tree.
-    """
-    if slot.worker_id in ("", "main"):
-        return False  # main working tree is not deleted
-    if not slot.path.exists():
-        return False  # already deleted
-    args = ["worktree", "remove"]
-    if force:
-        args.append("--force")
-    args.append(str(slot.path))
-    try:
-        _run_git(args, cwd=str(slot.main_repo))
-    except WorktreeError:
-        # git worktree remove failed (dirty working tree or other) — with
-        # force=False do not force-delete; let the caller decide. With
-        # force=True, propagate the failure upward.
-        if not force:
-            return False
-        raise
-    return True
-
-
-def delete_worktree_branch(slot: WorktreeSlot, *, force: bool = False) -> bool:
-    """Delete the branch associated with a worktree (call after worktree remove).
-
-    Default is a safe delete (``-d``); an unmerged branch will fail.
-    ``force=True`` uses ``-D`` to force-delete. Usually you do **not** need to
-    call this — keeping the branch for merge/review is more valuable.
-    """
-    if slot.worker_id in ("", "main"):
-        return False
-    args = ["branch", "-D" if force else "-d", slot.branch]
-    try:
-        _run_git(args, cwd=str(slot.main_repo))
-    except WorktreeError:
-        return False
-    return True
-
-
-def list_worktrees(project_path: str | Path) -> list[WorktreeSlot]:
-    """List all baton worktrees under the main repo (including the main working tree).
-
-    The first item of the returned list is always the main working tree
-    (worker_id="main").
-    """
-    project = Path(project_path).resolve()
-    if not _is_git_repo(project):
-        return []
-    result = _run_git(
-        ["worktree", "list", "--porcelain"],
-        cwd=str(project),
-    )
-    slots: list[WorktreeSlot] = []
-    current_path: Path | None = None
-    current_branch: str = ""
-    main_name = project.name
-    for line in (result.stdout or "").splitlines():
-        if line.startswith("worktree "):
-            if current_path is not None:
-                wid = _worker_id_from_path(current_path, main_name)
-                slots.append(
-                    WorktreeSlot(
-                        path=current_path,
-                        branch=current_branch or _branch_fallback(current_path),
-                        main_repo=project,
-                        worker_id=wid,
-                    )
-                )
-            current_path = Path(line[len("worktree "):])
-            current_branch = ""
-        elif line.startswith("branch "):
-            current_branch = line[len("branch "):]
-    if current_path is not None:
-        wid = _worker_id_from_path(current_path, main_name)
-        slots.append(
-            WorktreeSlot(
-                path=current_path,
-                branch=current_branch or _branch_fallback(current_path),
-                main_repo=project,
-                worker_id=wid,
-            )
-        )
-    return slots
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
 
 
 def _current_branch(path: Path) -> str:
@@ -465,27 +245,6 @@ def _branch_exists(repo: Path, branch: str) -> bool:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
     return result.returncode == 0
-
-
-def _branch_fallback(path: Path) -> str:
-    """Fallback used by list_worktrees when porcelain does not report a branch."""
-    return _current_branch(path) or "main"
-
-
-def _worker_id_from_path(path: Path, main_name: str) -> str:
-    """Reverse-derive worker_id from a worktree path.
-
-    ``/abs/<main_name>-w0`` → ``w0``; ``/abs/<main_name>`` (main working tree)
-    → ``main``. The worker_id segment in the path starts with ``-w``
-    (``-w0`` / ``-w1``).
-    """
-    name = path.name
-    prefix = f"{main_name}-w"
-    if name.startswith(prefix):
-        return "w" + name[len(prefix):]  # restore to w0/w1 (path is <name>-w0)
-    if name == main_name:
-        return "main"
-    return "main"
 
 
 def _git_quiet(args: list[str], cwd: str, timeout: int = 30) -> subprocess.CompletedProcess:
@@ -623,15 +382,8 @@ __all__ = [
     "assignment_worktree_path",
     "branch_is_merged",
     "cleanup_feature_worktrees",
-    "delete_worktree_branch",
     "integration_branch",
     "integration_worktree_path",
-    "list_worktrees",
     "prepare_assignment_worktree",
     "prepare_integration_worktree",
-    "prepare_worktree",
-    "remove_worktree",
-    "worktree_is_clean",
-    "worktree_branch",
-    "worktree_path",
 ]

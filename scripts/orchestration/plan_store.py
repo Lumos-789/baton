@@ -5,14 +5,12 @@ from __future__ import annotations
 import json
 import hashlib
 import os
-import re
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-from _frontier import compute_frontier, topo_sort
 from _ticket import (
     Ticket,
     TasksMarkdownError,
@@ -36,27 +34,9 @@ class PlanStoreError(RuntimeError):
     """Base class for plan-store failures."""
 
 
-
-
-
-
-class QueueTaskNotFoundError(PlanStoreError):
-    """Raised when a queue task id is unknown."""
-
-
-class QueueLeaseError(PlanStoreError):
-    """Raised when a queue lease cannot be updated or released."""
-
-
 class ExecutionAttemptError(PlanStoreError):
     """Raised when a session execution attempt transition is invalid."""
 
-
-PRIORITY_RANK = {
-    "normal": 10,
-    "high": 20,
-    "emergency": 30,
-}
 
 #: Attempt states that never transition again. ``superseded`` (a stale lease
 #: replaced by a retry) and ``abandoned`` (operator escape hatch) are terminal
@@ -155,44 +135,6 @@ class PlanStore:
             return plan
         finally:
             conn.close()
-
-
-
-    def plan_history(self) -> list[PlanRevision]:
-        self.ensure_initial_plan()
-        conn = self._connect()
-        try:
-            rows = conn.execute(
-                "SELECT snapshot_json FROM plan_revisions "
-                "WHERE job_id = ? ORDER BY revision",
-                (self.job_id,),
-            ).fetchall()
-            return [
-                # Historical snapshots use each revision's assignments as they
-                # were at its approval time, without injecting the current live
-                # assignments (otherwise every historical revision would show
-                # the same current snapshot, distorting audit/replay).
-                # live_assignments=False makes _plan_from_snapshot_json use the
-                # assignments baked into snapshot_json directly.
-                self._plan_from_snapshot_json(
-                    row["snapshot_json"], conn, live_assignments=False
-                )
-                for row in rows
-            ]
-        finally:
-            conn.close()
-
-    def record_assignment(self, assignment: AssignmentSnapshot) -> None:
-        """Record runtime assignment state without creating a semantic revision."""
-        self.ensure_initial_plan()
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            self._record_assignment_locked(conn, assignment)
-            conn.commit()
-        finally:
-            conn.close()
-        self._write_plan_json(self.current_plan())
 
     def claim_ready_assignments(
         self,
@@ -424,33 +366,6 @@ class PlanStore:
                 conn,
                 "execution.agent.bound",
                 {"assignmentId": assignment_id, "agentId": agent_id},
-            )
-            conn.commit()
-            return self.get_execution_attempt(assignment_id)
-        finally:
-            conn.close()
-
-    def heartbeat_execution_attempt(
-        self, assignment_id: str, claim_token: str, lease_seconds: int = 7200
-    ) -> ExecutionAttempt:
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            row = self._load_execution_attempt_locked(conn, assignment_id)
-            self._require_claim_token(row, claim_token)
-            if row["state"] in TERMINAL_ATTEMPT_STATES:
-                raise ExecutionAttemptError(f"attempt is terminal: {assignment_id}")
-            expires_at = _utc_after(lease_seconds)
-            now = utc_now()
-            conn.execute(
-                "UPDATE execution_attempts SET lease_expires_at = ?, updated_at = ? "
-                "WHERE job_id = ? AND assignment_id = ?",
-                (expires_at, now, self.job_id, assignment_id),
-            )
-            conn.execute(
-                "UPDATE attempt_resource_leases SET expires_at = ?, updated_at = ? "
-                "WHERE job_id = ? AND assignment_id = ?",
-                (expires_at, now, self.job_id, assignment_id),
             )
             conn.commit()
             return self.get_execution_attempt(assignment_id)
@@ -815,296 +730,6 @@ class PlanStore:
         self._write_plan_json(self.current_plan())
         return self.get_execution_attempt(assignment_id)
 
-    def enqueue_frontier(self, ticket_nums: list[int]) -> list[dict[str, Any]]:
-        """Add current-revision frontier tickets to the local resource queue."""
-        plan = self.current_plan()
-        tickets = {ticket.num: ticket for ticket in plan.tickets}
-        enqueued: list[dict[str, Any]] = []
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            for num in ticket_nums:
-                ticket = tickets.get(num)
-                if ticket is None or not ticket.required:
-                    continue
-                task = self._upsert_queue_task_locked(conn, plan, ticket)
-                if task is not None:
-                    enqueued.append(task)
-            if enqueued:
-                self._event_locked(
-                    conn,
-                    "queue.frontier.enqueued",
-                    {
-                        "revision": plan.revision,
-                        "tasks": enqueued,
-                    },
-                )
-            conn.commit()
-        finally:
-            conn.close()
-        return enqueued
-
-    def list_queue(self, status: str | None = None) -> list[dict[str, Any]]:
-        """Return queue tasks for the current job."""
-        self.ensure_initial_plan()
-        conn = self._connect()
-        try:
-            if status:
-                rows = conn.execute(
-                    "SELECT * FROM queue_tasks WHERE job_id = ? AND status = ? "
-                    "ORDER BY priority_rank DESC, created_at, queue_id",
-                    (self.job_id, status),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM queue_tasks WHERE job_id = ? "
-                    "ORDER BY priority_rank DESC, created_at, queue_id",
-                    (self.job_id,),
-                ).fetchall()
-            return [self._queue_row_to_dict(row) for row in rows]
-        finally:
-            conn.close()
-
-    def claim_next_queue_task(
-        self,
-        owner: str,
-        agent_profile: str = "",
-        lease_seconds: int = 3600,
-    ) -> dict[str, Any] | None:
-        """Claim the next queued task whose resources are available."""
-        self.ensure_initial_plan()
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            self._delete_expired_leases_locked(conn)
-            rows = conn.execute(
-                "SELECT * FROM queue_tasks "
-                "WHERE job_id = ? AND status = 'queued' "
-                "ORDER BY priority_rank DESC, created_at, queue_id",
-                (self.job_id,),
-            ).fetchall()
-            for row in rows:
-                task = self._queue_row_to_dict(row, include_leases=False)
-                if agent_profile and task["agentProfile"] not in {"", agent_profile}:
-                    continue
-                resources = task["resources"]
-                if self._resources_locked(conn, resources):
-                    continue
-                token = uuid.uuid4().hex
-                expires_at = _utc_after(lease_seconds)
-                now = utc_now()
-                for resource in resources:
-                    conn.execute(
-                        "INSERT INTO resource_leases "
-                        "(resource_key, queue_id, job_id, lease_token, owner, "
-                        "expires_at, created_at, updated_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                        (
-                            resource,
-                            task["queueId"],
-                            self.job_id,
-                            token,
-                            owner,
-                            expires_at,
-                            now,
-                            now,
-                        ),
-                    )
-                conn.execute(
-                    "UPDATE queue_tasks SET status = 'running', owner = ?, "
-                    "lease_token = ?, updated_at = ? WHERE queue_id = ?",
-                    (owner, token, now, task["queueId"]),
-                )
-                self._event_locked(
-                    conn,
-                    "queue.task.claimed",
-                    {
-                        "queueId": task["queueId"],
-                        "ticket": task["ticket"],
-                        "owner": owner,
-                        "leaseToken": token,
-                        "resources": resources,
-                        "expiresAt": expires_at,
-                    },
-                )
-                conn.commit()
-                task["status"] = "running"
-                task["owner"] = owner
-                task["leaseToken"] = token
-                task["leaseExpiresAt"] = expires_at
-                return task
-            conn.commit()
-            return None
-        finally:
-            conn.close()
-
-    def heartbeat_queue_task(
-        self,
-        queue_id: str,
-        lease_token: str,
-        lease_seconds: int = 3600,
-    ) -> dict[str, Any]:
-        """Extend a running task's resource leases."""
-        self.ensure_initial_plan()
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            task = self._load_queue_task_locked(conn, queue_id)
-            if task["leaseToken"] != lease_token or task["status"] != "running":
-                raise QueueLeaseError(f"invalid lease for queue task {queue_id}")
-            expires_at = _utc_after(lease_seconds)
-            now = utc_now()
-            conn.execute(
-                "UPDATE resource_leases SET expires_at = ?, updated_at = ? "
-                "WHERE queue_id = ? AND lease_token = ?",
-                (expires_at, now, queue_id, lease_token),
-            )
-            conn.execute(
-                "UPDATE queue_tasks SET updated_at = ? WHERE queue_id = ?",
-                (now, queue_id),
-            )
-            self._event_locked(
-                conn,
-                "queue.task.heartbeat",
-                {"queueId": queue_id, "leaseToken": lease_token, "expiresAt": expires_at},
-            )
-            conn.commit()
-            task["leaseExpiresAt"] = expires_at
-            return task
-        finally:
-            conn.close()
-
-    def complete_queue_task(
-        self,
-        queue_id: str,
-        lease_token: str,
-        status: str = "completed",
-    ) -> dict[str, Any]:
-        """Complete a claimed task and release its resource leases."""
-        if status not in {"completed", "failed", "canceled"}:
-            raise ValueError("status must be completed, failed, or canceled")
-        self.ensure_initial_plan()
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            task = self._load_queue_task_locked(conn, queue_id)
-            if task["leaseToken"] != lease_token:
-                raise QueueLeaseError(f"invalid lease for queue task {queue_id}")
-            now = utc_now()
-            conn.execute(
-                "DELETE FROM resource_leases WHERE queue_id = ? AND lease_token = ?",
-                (queue_id, lease_token),
-            )
-            conn.execute(
-                "UPDATE queue_tasks SET status = ?, lease_token = '', "
-                "updated_at = ? WHERE queue_id = ?",
-                (status, now, queue_id),
-            )
-            self._event_locked(
-                conn,
-                "queue.task.completed",
-                {
-                    "queueId": queue_id,
-                    "ticket": task["ticket"],
-                    "status": status,
-                    "releasedResources": task["resources"],
-                },
-            )
-            conn.commit()
-            task["status"] = status
-            task["leaseToken"] = ""
-            return task
-        finally:
-            conn.close()
-
-    def complete_queue_task_for_ticket(
-        self,
-        ticket_num: int,
-        status: str = "completed",
-    ) -> dict[str, Any] | None:
-        """Complete a running queue task by ticket number, if one exists."""
-        self.ensure_initial_plan()
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                "SELECT * FROM queue_tasks "
-                "WHERE job_id = ? AND ticket_num = ? AND status = 'running'",
-                (self.job_id, ticket_num),
-            ).fetchone()
-            if row is None:
-                conn.commit()
-                return None
-            task = self._queue_row_to_dict(row, include_leases=False)
-            now = utc_now()
-            conn.execute(
-                "DELETE FROM resource_leases WHERE queue_id = ? AND lease_token = ?",
-                (task["queueId"], task["leaseToken"]),
-            )
-            conn.execute(
-                "UPDATE queue_tasks SET status = ?, lease_token = '', "
-                "updated_at = ? WHERE queue_id = ?",
-                (status, now, task["queueId"]),
-            )
-            self._event_locked(
-                conn,
-                "queue.task.completed",
-                {
-                    "queueId": task["queueId"],
-                    "ticket": ticket_num,
-                    "status": status,
-                    "releasedResources": task["resources"],
-                },
-            )
-            conn.commit()
-            task["status"] = status
-            task["leaseToken"] = ""
-            return task
-        finally:
-            conn.close()
-
-    def record_result_envelope(self, envelope: ResultEnvelope) -> ResultEnvelope:
-        """Persist a structured Result Envelope for audit and handoff."""
-        self.ensure_initial_plan()
-        envelope_id = self._result_envelope_id(envelope)
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
-                "INSERT OR REPLACE INTO result_envelopes "
-                "(envelope_id, job_id, feature, ticket_num, assignment_id, "
-                "plan_revision, task_packet_hash, status, payload_json, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    envelope_id,
-                    self.job_id,
-                    self.feature,
-                    envelope.ticket_num,
-                    envelope.assignment_id,
-                    envelope.plan_revision,
-                    envelope.task_packet_hash,
-                    envelope.status,
-                    json.dumps(envelope.to_dict(), ensure_ascii=False, sort_keys=True),
-                    envelope.created_at,
-                ),
-            )
-            self._event_locked(
-                conn,
-                "result.envelope.recorded",
-                {
-                    "envelopeId": envelope_id,
-                    "ticket": envelope.ticket_num,
-                    "assignmentId": envelope.assignment_id,
-                    "status": envelope.status,
-                    "commitSha": envelope.commit_sha,
-                },
-            )
-            conn.commit()
-        finally:
-            conn.close()
-        self._write_result_envelope_json(envelope_id, envelope)
-        return envelope
-
     def result_envelopes(self) -> list[ResultEnvelope]:
         """Return persisted Result Envelopes for the current job."""
         self.ensure_initial_plan()
@@ -1211,7 +836,6 @@ class PlanStore:
                 blocked_by=parsed.blocked_by,
                 status=parsed.status,
                 criteria=[text for _, text in parsed.criteria],
-                verify=list(parsed.verify),
                 source_revision=revision,
             )
             for parsed in self._read_source_tickets()
@@ -1292,21 +916,6 @@ class PlanStore:
               snapshot_json TEXT NOT NULL,
               PRIMARY KEY (job_id, revision)
             );
-            CREATE TABLE IF NOT EXISTS amendments (
-              amendment_id TEXT PRIMARY KEY,
-              job_id TEXT NOT NULL,
-              feature TEXT NOT NULL,
-              base_revision INTEGER NOT NULL,
-              state TEXT NOT NULL,
-              classification TEXT NOT NULL,
-              request TEXT NOT NULL,
-              payload_json TEXT NOT NULL,
-              created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL,
-              applied_revision INTEGER
-            );
-            CREATE INDEX IF NOT EXISTS idx_amendments_job
-              ON amendments(job_id, created_at);
             CREATE TABLE IF NOT EXISTS assignments (
               job_id TEXT NOT NULL,
               assignment_id TEXT NOT NULL,
@@ -1329,38 +938,6 @@ class PlanStore:
             );
             CREATE INDEX IF NOT EXISTS idx_events_job
               ON events(job_id, id);
-            CREATE TABLE IF NOT EXISTS queue_tasks (
-              queue_id TEXT PRIMARY KEY,
-              job_id TEXT NOT NULL,
-              feature TEXT NOT NULL,
-              ticket_num INTEGER NOT NULL,
-              plan_revision INTEGER NOT NULL,
-              task_packet_hash TEXT NOT NULL,
-              agent_profile TEXT NOT NULL,
-              priority TEXT NOT NULL,
-              priority_rank INTEGER NOT NULL,
-              status TEXT NOT NULL,
-              resources_json TEXT NOT NULL,
-              owner TEXT NOT NULL,
-              lease_token TEXT NOT NULL,
-              created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL,
-              UNIQUE(job_id, ticket_num)
-            );
-            CREATE INDEX IF NOT EXISTS idx_queue_tasks_job_status
-              ON queue_tasks(job_id, status, priority_rank, created_at);
-            CREATE TABLE IF NOT EXISTS resource_leases (
-              resource_key TEXT PRIMARY KEY,
-              queue_id TEXT NOT NULL,
-              job_id TEXT NOT NULL,
-              lease_token TEXT NOT NULL,
-              owner TEXT NOT NULL,
-              expires_at TEXT NOT NULL,
-              created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_resource_leases_job
-              ON resource_leases(job_id, queue_id);
             CREATE TABLE IF NOT EXISTS result_envelopes (
               envelope_id TEXT PRIMARY KEY,
               job_id TEXT NOT NULL,
@@ -1468,23 +1045,13 @@ class PlanStore:
         self,
         snapshot_json: str,
         conn: sqlite3.Connection | None = None,
-        *,
-        live_assignments: bool = True,
     ) -> PlanRevision:
-        """Materialize a PlanRevision from a snapshot_json blob.
+        """Materialize a PlanRevision, injecting the live assignment state.
 
-        ``live_assignments=True`` (default, used for the *current* plan) reads
-        the live ``assignments`` table and injects it — the current plan should
-        reflect real-time assignment state. ``live_assignments=False`` (used
-        for ``plan_history``) keeps the assignments that were frozen into the
-        snapshot at approval time — historical revisions must show their own
-        assignments, not today's, or audit/replay is distorted.
+        The current plan must reflect real-time assignment state, so the live
+        ``assignments`` table is read and injected over the snapshot's copy.
         """
         plan = PlanRevision.from_dict(json.loads(snapshot_json))
-        if not live_assignments:
-            # Keep the assignments already parsed from the snapshot by
-            # from_dict — they are the ones frozen at approval time.
-            return plan
         close_conn = False
         if conn is None:
             conn = self._connect()
@@ -1584,203 +1151,6 @@ class PlanStore:
             assignment.to_dict(),
         )
 
-    def _default_workspace_resource(self) -> str:
-        return f"workspace:{self.project_path}"
-
-    def _task_resources(self, ticket: PlanTicket) -> list[str]:
-        resources = [self._default_workspace_resource()]
-        for resource in ticket.resources:
-            if resource not in resources:
-                resources.append(resource)
-        return resources
-
-    def _queue_task_hash(self, plan: PlanRevision, ticket: PlanTicket) -> str:
-        return stable_hash(
-            {
-                "planRevision": plan.revision,
-                "ticket": ticket.to_dict(),
-                "resources": self._task_resources(ticket),
-            }
-        )
-
-    def _upsert_queue_task_locked(
-        self,
-        conn: sqlite3.Connection,
-        plan: PlanRevision,
-        ticket: PlanTicket,
-    ) -> dict[str, Any] | None:
-        queue_id = f"Q-{self.feature}-{ticket.num:03d}"
-        resources = self._task_resources(ticket)
-        now = utc_now()
-        row = conn.execute(
-            "SELECT * FROM queue_tasks WHERE job_id = ? AND ticket_num = ?",
-            (self.job_id, ticket.num),
-        ).fetchone()
-        payload = {
-            "queueId": queue_id,
-            "jobId": self.job_id,
-            "feature": self.feature,
-            "ticket": ticket.num,
-            "planRevision": plan.revision,
-            "taskPacketHash": self._queue_task_hash(plan, ticket),
-            "agentProfile": ticket.agent_profile,
-            "priority": ticket.priority,
-            "priorityRank": PRIORITY_RANK.get(ticket.priority, PRIORITY_RANK["normal"]),
-            "status": "queued",
-            "resources": resources,
-            "owner": "",
-            "leaseToken": "",
-        }
-        if row is None:
-            conn.execute(
-                "INSERT INTO queue_tasks "
-                "(queue_id, job_id, feature, ticket_num, plan_revision, "
-                "task_packet_hash, agent_profile, priority, priority_rank, "
-                "status, resources_json, owner, lease_token, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    queue_id,
-                    self.job_id,
-                    self.feature,
-                    ticket.num,
-                    plan.revision,
-                    payload["taskPacketHash"],
-                    ticket.agent_profile,
-                    ticket.priority,
-                    payload["priorityRank"],
-                    "queued",
-                    json.dumps(resources, ensure_ascii=False),
-                    "",
-                    "",
-                    now,
-                    now,
-                ),
-            )
-            self._event_locked(conn, "queue.task.enqueued", payload)
-            return payload
-
-        existing = self._queue_row_to_dict(row)
-        if existing["status"] != "queued":
-            return None
-        conn.execute(
-            "UPDATE queue_tasks SET plan_revision = ?, task_packet_hash = ?, "
-            "agent_profile = ?, priority = ?, priority_rank = ?, "
-            "resources_json = ?, updated_at = ? WHERE queue_id = ?",
-            (
-                plan.revision,
-                payload["taskPacketHash"],
-                ticket.agent_profile,
-                ticket.priority,
-                payload["priorityRank"],
-                json.dumps(resources, ensure_ascii=False),
-                now,
-                queue_id,
-            ),
-        )
-        self._event_locked(conn, "queue.task.updated", payload)
-        return payload
-
-    def _queue_row_to_dict(
-        self,
-        row: sqlite3.Row,
-        include_leases: bool = True,
-    ) -> dict[str, Any]:
-        leases = self._leases_for_queue(row["queue_id"]) if include_leases else []
-        return {
-            "queueId": row["queue_id"],
-            "jobId": row["job_id"],
-            "feature": row["feature"],
-            "ticket": row["ticket_num"],
-            "planRevision": row["plan_revision"],
-            "taskPacketHash": row["task_packet_hash"],
-            "agentProfile": row["agent_profile"],
-            "priority": row["priority"],
-            "priorityRank": row["priority_rank"],
-            "status": row["status"],
-            "resources": json.loads(row["resources_json"]),
-            "owner": row["owner"],
-            "leaseToken": row["lease_token"],
-            "leases": leases,
-        }
-
-    def _leases_for_queue(self, queue_id: str) -> list[dict[str, Any]]:
-        conn = self._connect()
-        try:
-            rows = conn.execute(
-                "SELECT resource_key, owner, expires_at, lease_token "
-                "FROM resource_leases WHERE queue_id = ? ORDER BY resource_key",
-                (queue_id,),
-            ).fetchall()
-            return [
-                {
-                    "resource": row["resource_key"],
-                    "owner": row["owner"],
-                    "expiresAt": row["expires_at"],
-                    "leaseToken": row["lease_token"],
-                }
-                for row in rows
-            ]
-        finally:
-            conn.close()
-
-    def _load_queue_task_locked(
-        self,
-        conn: sqlite3.Connection,
-        queue_id: str,
-    ) -> dict[str, Any]:
-        row = conn.execute(
-            "SELECT * FROM queue_tasks WHERE job_id = ? AND queue_id = ?",
-            (self.job_id, queue_id),
-        ).fetchone()
-        if row is None:
-            raise QueueTaskNotFoundError(queue_id)
-        return self._queue_row_to_dict(row, include_leases=False)
-
-    def _delete_expired_leases_locked(self, conn: sqlite3.Connection) -> None:
-        now = utc_now()
-        rows = conn.execute(
-            "SELECT queue_id, lease_token FROM resource_leases WHERE expires_at <= ?",
-            (now,),
-        ).fetchall()
-        expired = {(row["queue_id"], row["lease_token"]) for row in rows}
-        if not expired:
-            return
-        conn.execute("DELETE FROM resource_leases WHERE expires_at <= ?", (now,))
-        for queue_id, lease_token in expired:
-            remaining = conn.execute(
-                "SELECT COUNT(*) AS c FROM resource_leases "
-                "WHERE queue_id = ? AND lease_token = ?",
-                (queue_id, lease_token),
-            ).fetchone()
-            if int(remaining["c"]) == 0:
-                conn.execute(
-                    "UPDATE queue_tasks SET status = 'queued', owner = '', "
-                    "lease_token = '', updated_at = ? "
-                    "WHERE queue_id = ? AND lease_token = ? AND status = 'running'",
-                    (now, queue_id, lease_token),
-                )
-                self._event_locked(
-                    conn,
-                    "queue.task.lease-expired",
-                    {"queueId": queue_id, "leaseToken": lease_token},
-                )
-
-    def _resources_locked(
-        self,
-        conn: sqlite3.Connection,
-        resources: list[str],
-    ) -> bool:
-        if not resources:
-            return False
-        now = utc_now()
-        placeholders = ",".join("?" for _ in resources)
-        rows = conn.execute(
-            f"SELECT resource_key FROM resource_leases "
-            f"WHERE resource_key IN ({placeholders}) AND expires_at > ?",
-            (*resources, now),
-        ).fetchall()
-        return bool(rows)
-
     @staticmethod
     def _claim_token_hash(claim_token: str) -> str:
         return hashlib.sha256(claim_token.encode("utf-8")).hexdigest()
@@ -1872,13 +1242,6 @@ class PlanStore:
                 "execution.attempt.unknown",
                 {"assignmentId": assignment_id, "reason": "lease-expired"},
             )
-
-
-
-
-
-
-
 
 
     def _write_plan_json(self, plan: PlanRevision) -> None:

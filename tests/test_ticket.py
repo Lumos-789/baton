@@ -186,7 +186,6 @@ def test_ticket_dataclass_defaults():
     ticket = Ticket(num=101, title="x")
     assert ticket.status == "ready"
     assert ticket.blocked_by == []
-    assert ticket.verify == []
     assert ticket.task_id == "1.1"
 
 

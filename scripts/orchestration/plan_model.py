@@ -48,7 +48,6 @@ class PlanTicket:
     agent_profile: str = ""
     resources: list[str] = field(default_factory=list)
     authority: list[str] = field(default_factory=list)
-    verify: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PlanTicket":
@@ -72,7 +71,6 @@ class PlanTicket:
             agent_profile=str(data.get("agent_profile", "")),
             resources=[str(x) for x in data.get("resources", [])],
             authority=[str(x) for x in data.get("authority", [])],
-            verify=[str(x) for x in data.get("verify", [])],
         )
 
     def to_dict(self) -> dict[str, Any]:

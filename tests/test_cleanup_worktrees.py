@@ -1,4 +1,4 @@
-"""test_cleanup_worktrees.py — tests for session_control.cleanup_worktrees.
+"""test_cleanup_worktrees.py — tests for worktree.cleanup_feature_worktrees (the `cleanup` verb).
 
 Locks the safety contract:
 - removes only baton/<feature>-tic-* assignment worktrees by default

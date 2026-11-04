@@ -17,7 +17,10 @@ from orchestration.session_controller import (  # noqa: E402
     SessionController,
     SessionControllerError,
 )
-from orchestration.worktree import WorktreeError  # noqa: E402
+from orchestration.worktree import (  # noqa: E402
+    WorktreeError,
+    cleanup_feature_worktrees,
+)
 
 # Domain failures the CLI renders as one JSON error line; anything else
 # (TypeError, bugs) keeps its full traceback — fail loud, just not ugly.
@@ -65,25 +68,6 @@ def _ok(value: object) -> dict[str, object]:
     if hasattr(value, "to_dict"):
         value = value.to_dict()
     return {"ok": True, **value} if isinstance(value, dict) else {"ok": True}
-
-
-def cleanup_worktrees(
-    project: str,
-    feature: str,
-    *,
-    include_integration: bool = False,
-    dry_run: bool = False,
-) -> dict:
-    """Thin delegate to orchestration.worktree.cleanup_feature_worktrees.
-
-    Kept for CLI/back-compat; the real logic lives in worktree.py and is also
-    called automatically by the controller when a run reaches ``complete``.
-    """
-    from orchestration.worktree import cleanup_feature_worktrees
-
-    return cleanup_feature_worktrees(
-        project, feature, include_integration=include_integration, dry_run=dry_run
-    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -160,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "cleanup":
             _print(
-                cleanup_worktrees(
+                cleanup_feature_worktrees(
                     args.project,
                     args.feature,
                     include_integration=args.include_integration,

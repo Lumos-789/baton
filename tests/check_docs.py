@@ -23,8 +23,11 @@ ROOT = Path(__file__).resolve().parent.parent
 CHECKED_DOCS = [
     ROOT / "AGENTS.md",
     ROOT / "README.md",
+    ROOT / "README_CN.md",
     ROOT / "skills" / "baton" / "SKILL.md",
     ROOT / "scripts" / "orchestration" / "AGENTS.md",
+    ROOT / "docs" / "architecture.md",
+    ROOT / "docs" / "ticket-format.md",
 ]
 
 # Repo dirs whose contents docs may reference by relative path.

@@ -40,6 +40,21 @@ identity are now enforced by the controller instead of documented only.
 
 Regression: `./tests/regression.sh` — 172 passed, 5/5 stages green.
 
+### Simplification pass (same unreleased version)
+
+- **`SKILL.md` was teaching a command that does not exist.** It documented
+  `run <project> <change-id>` as the canonical verb, "no subcommand -> defaults
+  to `run`", and `Default session_id="baton-run"`. The real CLI has no `run`
+  verb, `add_subparsers(required=True)`, and `--session-id` is required. An
+  agent following the skill would have failed on its first call. The skill now
+  tables the six real verbs with their argument contracts.
+- SKILL.md 351 → 229 lines: the ASCII loop diagram (duplicated in README,
+  architecture and AGENTS), the `tasks.md` sample (duplicated verbatim in
+  `docs/ticket-format.md`), the `status` response schema and the "Typical usage"
+  walkthrough were all second copies. Every removed section is now a pointer.
+- Leases are documented: fixed **7200 s**, no renewal entry point, so a ticket
+  longer than two hours always returns `lease-expired` and is re-dispatched.
+
 ## 0.3.0 (2026-11-04)
 
 Baton is one product again: the ticket/DAG control plane. Two things that were

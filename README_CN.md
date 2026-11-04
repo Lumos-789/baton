@@ -22,7 +22,9 @@ Baton 把一个已批准的变更确定性地变成完成的工作：主会话�
 输出不被采信。
 
 密封回执是 `receipt.py` 在本地产生的哈希绑定证据（任务包哈希 + 干净前进的 HEAD +
-退出码为 0 的验证结果）。它是完整性证据，不是对抗恶意子代理的密码学证明。
+退出码为 0 的验证结果）。整份回执正文由规范化 `sha256` 摘要（`receiptHash`）覆盖：
+改动 `exitCode`、`changed_files`、`commit_sha`，或拿别的 ticket 的租约来顶替，
+都会在集成前被拒。它是完整性证据，不是对抗恶意子代理的密码学证明（摘要没有密钥）。
 
 三条接缝由确定性机制桥接：
 
@@ -131,12 +133,20 @@ SessionController（唯一确定性调度器）
 - **隔离 worktree** — 每个任务一个分支；容量 <=5 的滑动窗口；集成由仓库级锁串行。
 - **密封回执** — `scripts/receipt.py` 的 `verify` / `seal` 是唯一被采信的成功
   证据；没有回执的完成通知把尝试翻成 `unknown`。
+- **固定 7200 s 租约** — 认领的租约硬编码为 7200 s（2 小时）：没有 CLI 开关，
+  也没有续租入口。租约超时即判 `lease-expired`（尝试翻成 `unknown` 并带上该
+  `failure_code`），下一次 `actions` 调用会重新派发该 ticket。
+- **运维逃生口** — `abandon <assignment_id>` 退役卡住的尝试：释放租约、取消它
+  参与结算的资格，但 worktree、分支、提交、任务包和回执都留在磁盘上供审计。
 
 **控制面**：
 - **OpenSpec 原生的认知阶段** — “用 baton 完成 X” 指先跑项目的 OpenSpec 工作流
   （对齐 -> 写变更 -> 用户批准），再驱动执行到 `complete`。
 - **活计划 = 直接改 tasks.md** — 运行中增删任务，下一次 `actions()` 记录新计划
   修订并重算前沿；在飞的任务包保持不可变。
+- **验证是变更级且持久化** — `--verify "<cmd>"`（顶层参数，可重复）在首次认领时
+  随本次运行持久化，之后的任务包（包括 `reconcile` 准备的）都复用它；再次传入
+  即显式覆盖。不存在 per-task 验证覆盖。
 
 **可观测性**：`scripts/ticket_board.py` 为项目的 OpenSpec 变更生成纯静态 HTML
 看板（零进程、零端口）：
@@ -156,8 +166,25 @@ python3 scripts/ticket_board.py build /path/to/project <change-id>
 | `cordis.patch.yml` | DSH bundle insert 行（`dsh-openspec-baton`） |
 | `.zcode-plugin/plugin.json` | ZCode 插件清单（同一技能） |
 | `skills/baton/SKILL.md` | `baton` 技能（actions -> subagent -> reconcile） |
-| `scripts/session_control.py` | 控制面 CLI（`actions`/`bind`/`reconcile`/`status`/`cleanup`） |
+| `scripts/session_control.py` | 控制面 CLI（`actions`/`bind`/`reconcile`/`status`/`cleanup`/`abandon`） |
 | `scripts/` | 确定性控制器、计划存储、回执 |
+
+## 历史
+
+Baton v1 驱动外部的 `ralph.sh` 循环。v2 把循环搬进 Python。v3 用子代理替换了
+子进程模型，但仍然依赖共享 PRD + `passes` 标记。v4 退役 PRD/passes 协议，让
+`SessionController` 成为唯一确定性调度器。v5 把 OpenSpec 采纳为唯一的计划面：
+变更的 `tasks.md` 就是 ticket 源（按 section 顺序的 DAG、`[x]` 回写），自建的
+认知/修订引擎随之退役。**v6（当前）** 去掉本地 MCP 适配层：插件仍在迭代期，
+CLI 是唯一的控制面。
+
+## 要求
+
+- **DSH** `0.2.1-rc.2` 或更新，且 `subagent` 可用（`dsh-base`）
+- **Python 3.10+**（macOS/Linux 上的 `python3`、Windows 上的 `python`，或用
+  `BATON_PYTHON` 指定）+ pytest
+- 一个 **git** 目标仓库（控制器要在其中准备隔离 worktree）
+- 目标项目使用 **OpenSpec**（`openspec/changes/<id>/tasks.md`）
 
 ## 回归
 

@@ -432,7 +432,7 @@ class SessionController:
                 base_commit=attempt.base_sha,
                 project_path=str(slot.path),
                 resources=list(ticket.resources),
-                verification_commands=list(ticket.verify) or list(verification_commands),
+                verification_commands=list(verification_commands),
                 output_contract=["sealed receipt"],
                 plan_revision=attempt.plan_revision,
             )

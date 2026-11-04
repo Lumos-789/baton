@@ -24,9 +24,9 @@ cognitive state machine on the active path.
 | `index.js` | mounts the bundled `skills/` provider |
 | `skills/baton/SKILL.md` | skill definition (frontmatter + the actions → subagent → bind → reconcile loop over OpenSpec changes) |
 | `scripts/_ticket.py` | **OpenSpec tasks.md parser** — change→feature, task `N.M`→ticket, section-order DAG, `[x]` write-back (spec: `docs/ticket-format.md`) |
-| `scripts/_frontier.py` | DAG + frontier + topological sort (shared module) |
+| `scripts/_frontier.py` | DAG + frontier (shared module) |
 | `scripts/orchestration/session_controller.py` | **SessionController** — the sole deterministic scheduler: actions, native-agent binding, sealed-receipt reconciliation, integration, recovery, latest-plan completion |
-| `scripts/orchestration/plan_store.py` | durable plan store (`queue.db`): plan revisions (synced from tasks.md edits), execution attempts, leases, sealed receipts, completion facts, local queue |
+| `scripts/orchestration/plan_store.py` | durable plan store (`queue.db`): plan revisions (synced from tasks.md edits), execution attempts, leases, sealed receipts, completion facts |
 | `scripts/orchestration/plan_model.py` | shared plan data model: `PlanTicket` / `AssignmentSnapshot` / `PlanRevision` + `utc_now`/`stable_hash` |
 | `scripts/orchestration/integrator.py` | serial git integration of assignment branches; preserves merge conflicts for `resolve_merge` |
 | `scripts/orchestration/worktree.py` | isolated assignment + integration worktrees (one branch per assignment) |
