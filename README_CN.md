@@ -1,0 +1,189 @@
+<p align="center"><img src="assets/baton/icon.png" width="88" height="88" alt="Baton 图标"></p>
+
+<h1 align="center">Baton</h1>
+
+<p align="center"><a href="#回归"><img src="https://img.shields.io/badge/tests-pytest%20green-brightgreen" alt="Tests"></a>
+<a href="#"><img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python"></a>
+<a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-yellow" alt="License: MIT"></a>
+<a href="https://github.com/Lumos-789/baton"><img src="https://img.shields.io/github/stars/Lumos-789/baton?style=social" alt="Stars"></a></p>
+
+> OpenSpec 变更唯一的 ticket / DAG / 会话子代理控制面。
+> 本地 CLI 返回确定性的会话动作；主会话用 DSH `subagent` 工具派发每个任务包、
+> 绑定子代理 id，并依据密封回执（sealed receipt）结算完成通知。
+
+**[Discussions](https://github.com/Lumos-789/baton/discussions)**
+
+## 解决什么问题
+
+OpenSpec 擅长规格驱动的分解（proposal -> tasks -> archive），但不负责执行。
+Baton 把一个已批准的变更确定性地变成完成的工作：主会话从不自行决定 ticket 状态，
+而是原样转发 Baton CLI 返回的确定性 `actions` 给 DSH 子代理，再把每个完成
+通知对照**密封回执**（任务的验证命令在隔离 worktree 中全绿）结算。子代理的自由文本
+输出不被采信。
+
+密封回执是 `receipt.py` 在本地产生的哈希绑定证据（任务包哈希 + 干净前进的 HEAD +
+退出码为 0 的验证结果）。它是完整性证据，不是对抗恶意子代理的密码学证明。
+
+三条接缝由确定性机制桥接：
+
+| 接缝 | Baton 的答案 |
+|---|---|
+| 依赖（按 section 顺序的 DAG -> 下一步跑什么） | `SessionController.actions()` 每次调用重算前沿并原子认领不同任务 |
+| 并发（<=5 个并行任务） | 每个任务一个隔离 git worktree；集成由仓库级锁串行化 |
+| 状态（子代理结束 -> 任务完成） | 密封回执是唯一成功证据；控制器集成分支、落定尝试、回写 tasks.md 的 `[x]` |
+
+**Baton 是指挥。`SessionController` 是唯一确定性调度器；主会话是机械转发器；
+OpenSpec 是计划面。**
+
+## 安装（DSH）
+
+Baton 是一个 DSH bundle：一个包挂载 `baton` 技能，执行通过内置的 Python CLI
+（`scripts/session_control.py`）完成。要求 DSH `0.2.1-rc.2` 或更新、提供
+`subagent` 工具的 profile（自带的 `dsh-base` 即可）、PATH 上有 Python 3.10+
+（或用 `BATON_PYTHON` 指定）。
+
+```bash
+# 从 checkout 安装
+dsh plugin add /path/to/baton
+
+# 发布后
+dsh plugin add dsh-openspec-baton
+```
+
+自检（自包含，只需 `python3` + `git`；对临时 git 仓库驱动真实 CLI，健康则退出 0）：
+
+```bash
+python3 tests/cli_smoke.py
+# CLI SMOKE PASS: actions dispatch, status snapshot, error exit - all green
+```
+
+包名用 `dsh-openspec-baton` 以避开无关的 `dsh-baton` 插件；仓库名与品牌保持
+`baton`。
+
+## 安装（ZCode）
+
+同一仓库还带有 ZCode 插件形态（`.zcode-plugin/plugin.json`）：挂载同一份
+`skills/baton/SKILL.md`，技能驱动同样的 `python3 scripts/session_control.py` CLI。
+要求 `python3` 可达且为 Python 3.10+。
+
+## 快速开始
+
+在业务项目里按项目自身的 openspec 工作流写一个变更并获批：
+
+```
+openspec/changes/<change-id>/proposal.md + tasks.md   （未勾选的 N.M 任务）
+```
+
+`tasks.md` 就是 ticket 源：section 是阶段，任务带 `N.M` 编号，一个任务被它之前
+所有 section 的任务阻塞（同一 section 内并行）。最小形态：
+
+```markdown
+# Tasks: add-login
+
+## 1. 后端
+
+- [x] 1.1 token 端点
+- [ ] 1.2 会话持久化
+
+## 2. 前端
+
+- [ ] 2.1 登录表单
+```
+
+`[x]` = 已完成，`[ ]` = 就绪（没有草稿态）；精确解析规则见
+[docs/ticket-format.md](docs/ticket-format.md)。
+
+然后对会话说：
+
+```
+run baton on <project_path> <change-id>
+```
+
+技能会驱动 `actions` -> `subagent` -> `bind` -> 完成通知 -> `reconcile`，
+直到批次返回 `complete`。
+
+## 架构
+
+```
+主会话（机械转发器 — 不做任何模型驱动的状态决策）
+  |- session_control.py <project> <change> actions --session-id ... --capacity<=5
+  |     -> SessionController.actions()：恢复/结算密封回执、计算前沿、原子认领、
+  |        准备隔离 worktree 与不可变任务包，返回
+  |        dispatch/recover/resolve_merge/wait/blocked/complete 动作
+  |- subagent(dispatch.prompt, cwd=dispatch.cwd) -> 子代理 id
+  |- session_control.py <project> <change> bind <assignment_id> <claim_token> <agent_id>
+  |- 运行时送达子代理完成通知
+  `- session_control.py <project> <change> reconcile ... --agent-terminal ...
+        -> 密封回执 -> 成功并集成；否则 unknown + recover
+
+SessionController（唯一确定性调度器）
+  |- 持久计划存储（.dsh/baton/queue.db）：修订、尝试、租约、密封回执、完成事实
+  |- 隔离的任务 worktree + 共享集成 worktree
+  |- 串行 git 集成；合并冲突保留（从不自动放弃）
+  `- 按最新计划判定完成（全部必需 ticket 已验证并集成）
+```
+
+## 能力
+
+**会话子代理执行**（唯一路径）：
+- **确定性调度** — 认领、租约、worktree、回执验证、集成、完成判定全部脚本化，
+  模型不决定状态。
+- **隔离 worktree** — 每个任务一个分支；容量 <=5 的滑动窗口；集成由仓库级锁串行。
+- **密封回执** — `scripts/receipt.py` 的 `verify` / `seal` 是唯一被采信的成功
+  证据；没有回执的完成通知把尝试翻成 `unknown`。
+
+**控制面**：
+- **OpenSpec 原生的认知阶段** — “用 baton 完成 X” 指先跑项目的 OpenSpec 工作流
+  （对齐 -> 写变更 -> 用户批准），再驱动执行到 `complete`。
+- **活计划 = 直接改 tasks.md** — 运行中增删任务，下一次 `actions()` 记录新计划
+  修订并重算前沿；在飞的任务包保持不可变。
+
+**可观测性**：`scripts/ticket_board.py` 为项目的 OpenSpec 变更生成纯静态 HTML
+看板（零进程、零端口）：
+
+```bash
+python3 scripts/ticket_board.py build-all /path/to/project
+# -> .dsh/baton/board-all.html   （所有变更一板）
+python3 scripts/ticket_board.py build /path/to/project <change-id>
+# -> .dsh/baton/<change-id>/board.html
+```
+
+**独立协同内核**：`scripts/queue.py` 不依赖 baton 会话 — 把任意 shell
+命令包进资源闸门、提交后台任务、冻结资源、全量审计。状态在一个 SQLite 库
+（默认 `~/.baton/coordination/queue.db`，`--db` 可覆盖）。核心是排空屏障
+（drain barrier）：破坏性命令（迁移、重建索引）与资源上的其他使用者不再竞速 —
+新的认领排队，在飞租约跑完，屏障始终会解冻：
+
+```bash
+python3 scripts/queue.py gate --resource db:prod --reason "schema migration" \
+  -- ./migrate.sh
+```
+
+## 包内容
+
+| 路径 | 用途 |
+|---|---|
+| `index.js` | 挂载内置 `skills/` provider |
+| `cordis.patch.yml` | DSH bundle insert 行（`dsh-openspec-baton`） |
+| `.zcode-plugin/plugin.json` | ZCode 插件清单（同一技能） |
+| `skills/baton/SKILL.md` | `baton` 技能（actions -> subagent -> reconcile） |
+| `scripts/session_control.py` | 控制面 CLI（`actions`/`bind`/`reconcile`/`status`/`cleanup`） |
+| `scripts/` | 确定性控制器、计划存储、回执、队列 CLI |
+
+## 回归
+
+标准回测入口 — 完整 pytest 套件（含临时 git fixture 的 e2e）、真实 CLI 冒烟、
+文档/文件一致性检查：
+
+```bash
+./tests/regression.sh
+```
+
+## 文档
+
+- [docs/architecture.md](docs/architecture.md) — 为什么确定性控制面是核心 IP
+- [docs/ticket-format.md](docs/ticket-format.md) — OpenSpec 变更 -> ticket 映射规格
+
+## 许可
+
+MIT

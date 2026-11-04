@@ -1,0 +1,38 @@
+# Build artifacts
+*.pyc
+__pycache__/
+.pytest_cache/
+node_modules/
+
+# Watchdog runtime (logs + state, change every run)
+logs/
+
+# macOS
+.DS_Store
+
+# Editors
+.idea/
+.vscode/
+.codegraph/
+
+# Runtime artifacts at project root (generated per feature)
+prd-*.json
+progress-*.txt
+.last-branch-*
+
+# Secrets / credentials — never commit webhook keys, API keys, tokens, or
+# local config files carrying them. These live outside the repo
+# (e.g. ~/.baton/notify.json) but this guards against accidental placement.
+*.env
+.env
+.env.*
+notify.json
+*_key.json
+secrets.json
+
+
+# Local DSH runtime state (plan store, receipts, boards), never committed
+.dsh/
+
+# Agent working notes, never committed
+.agents/

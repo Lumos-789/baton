@@ -1,0 +1,250 @@
+<p align="center"><img src="assets/baton/icon.png" width="88" height="88" alt="Baton icon"></p>
+
+<h1 align="center">Baton</h1>
+
+<p align="center"><a href="#regression"><img src="https://img.shields.io/badge/tests-pytest%20green-brightgreen" alt="Tests"></a>
+<a href="#"><img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python"></a>
+<a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-yellow" alt="License: MIT"></a>
+<a href="https://github.com/Lumos-789/baton"><img src="https://img.shields.io/github/stars/Lumos-789/baton?style=social" alt="Stars"></a></p>
+
+> The sole ticket / DAG / session-subagent control plane over OpenSpec changes.
+> A local CLI exposes deterministic session actions; the main session
+> delegates each assignment with the DSH `subagent` tool, binds the child id,
+> and reconciles the completion notice against a sealed receipt.
+
+**[Discussions](https://github.com/Lumos-789/baton/discussions)**
+
+## The problem it solves
+
+OpenSpec is strong on spec-driven decomposition (proposal -> tasks -> archive)
+but does not execute. Baton turns an approved change into finished work,
+deterministically: the main session never decides ticket state itself. It
+forwards the deterministic `actions` returned by the Baton CLI to DSH
+subagents verbatim, then reconciles each completion notice against a **sealed
+receipt** (the assignment's verification commands run green in an isolated
+worktree). Free-text subagent output is ignored.
+
+A sealed receipt is hash-bound evidence produced locally by `receipt.py`
+(task-packet hash + clean, advanced HEAD + exit-0 verification results). It is
+integrity evidence, not a cryptographic proof against a hostile subagent.
+
+The change's tasks and the execution share the same granularity (one
+assignment ~ one task), and three seams are bridged deterministically:
+
+| Seam | Baton's answer |
+|---|---|
+| Dependency (section-order DAG -> what to run next) | `SessionController.actions()` computes the frontier fresh every call and atomically claims distinct tasks |
+| Concurrency (<=5 parallel tasks) | one isolated git worktree per assignment; integration serialized by a repository-scoped lock |
+| State (subagent done -> task resolved) | a sealed receipt is the only success evidence; the controller integrates the branch, finalizes the attempt, and flips the task's `[x]` in tasks.md |
+
+**Baton is the conductor. `SessionController` is the sole deterministic
+scheduler; the main session is a mechanical forwarder; OpenSpec is the plan
+face.**
+
+## Install (DSH)
+
+Baton is a DSH bundle: one package mounts the `baton` skill. Execution goes
+through the bundled Python CLI (`scripts/session_control.py`). It requires DSH
+`0.2.1-rc.2` or newer, a profile that provides the `subagent` tool (the shipped
+`dsh-base` does), and Python 3.10+ on `PATH` (or `BATON_PYTHON` pointing at it).
+
+```bash
+# From a checkout
+dsh plugin add /path/to/baton
+
+# Once published
+dsh plugin add dsh-openspec-baton
+```
+
+Verify the bundle (self-contained, needs only `python3` + `git`; drives the
+real CLI against a temp git repo and exits 0 when healthy):
+
+```bash
+python3 tests/cli_smoke.py
+# CLI SMOKE PASS: actions dispatch, status snapshot, error exit - all green
+```
+
+The package name is `dsh-openspec-baton` to avoid colliding with the unrelated
+`dsh-baton` plugin. The repository and brand remain `baton`.
+
+## Install (ZCode)
+
+The same repository also carries a ZCode plugin form
+(`.zcode-plugin/plugin.json`): it mounts the identical
+`skills/baton/SKILL.md`; the skill drives the same
+`python3 scripts/session_control.py` CLI. Python 3.10+ must be reachable as
+`python3`.
+
+## Quick start
+
+```bash
+# In your business project, write an OpenSpec change (the project's normal
+# openspec/AGENTS.md workflow) and get it approved:
+#   openspec/changes/<change-id>/proposal.md + tasks.md   (unchecked N.M tasks)
+```
+
+`tasks.md` is the ticket source. Sections are phases, tasks carry `N.M` ids,
+and a task is blocked by every task in earlier sections (tasks within one
+section run in parallel). Minimal shape:
+
+```markdown
+# Tasks: add-login
+
+## 1. Backend
+
+- [x] 1.1 token endpoint
+- [ ] 1.2 session persistence
+
+## 2. Frontend
+
+- [ ] 2.1 login form
+```
+
+`[x]` = resolved, `[ ]` = ready (no draft state); the exact parsing rules are
+in [docs/ticket-format.md](docs/ticket-format.md).
+
+Then ask the session:
+
+```
+run baton on <project_path> <change-id>
+```
+
+The skill drives `actions` -> `subagent` -> `bind` -> completion notice
+-> `reconcile` until the batch returns `complete`.
+
+## Architecture
+
+```
+main session (mechanical forwarder - no model-driven state decisions)
+  |- session_control.py <project> <change> actions --session-id ... --capacity<=5
+  |     -> SessionController.actions(): recover/reconcile sealed receipts,
+  |        compute frontier, atomically claim, prepare isolated worktrees +
+  |        immutable Task Packets, return dispatch/recover/resolve_merge/
+  |        wait/blocked/complete actions
+  |- subagent(dispatch.prompt, cwd=dispatch.cwd) -> child id
+  |- session_control.py <project> <change> bind <assignment_id> <claim_token> <agent_id>
+  |- runtime sends the subagent completion notice
+  |- session_control.py <project> <change> reconcile ... --agent-terminal ...
+        -> sealed receipt -> succeeded + integrated; otherwise unknown + recover
+
+SessionController (the sole deterministic scheduler)
+  |- durable plan store (.dsh/baton/queue.db): revisions, attempts, leases,
+  |  sealed receipts, completion facts
+  |- isolated assignment worktrees + a shared integration worktree
+  |- serial git integration; merge conflicts preserved (never auto-aborted)
+  `- latest-plan completion (all required tickets verified + integrated)
+```
+
+## Capabilities
+
+**Session-subagent execution** (sole path):
+- **Deterministic scheduling** - claim, lease, worktree, receipt verification,
+  integration, completion are all scripted; the model never decides state.
+- **Isolated worktrees** - one branch per assignment; capacity <= 5 sliding
+  window; integration serialized by a repository-scoped lock.
+- **Sealed receipts** - `scripts/receipt.py verify` / `seal` is the only
+  accepted success evidence; a completion notice without a receipt flips the
+  attempt to `unknown`.
+
+**Control plane**:
+- **OpenSpec-native cognitive phase** - "use baton to finish X" means the
+  session runs the project's OpenSpec workflow (align -> write the change ->
+  user approves), then drives execution to `complete`. No self-built
+  Grill/Brief/approval state machine.
+- **Live plan = edit tasks.md** - add tasks or sections at runtime; the next
+  `actions()` call records a new plan revision and the frontier is recomputed.
+  In-flight packets stay immutable.
+
+**Observability**: `scripts/ticket_board.py` produces a pure static HTML
+Kanban board over a project's OpenSpec changes (zero process, zero port,
+colored feature tags, open via `file://`):
+
+```bash
+python3 scripts/ticket_board.py build-all /path/to/project
+# → .dsh/baton/board-all.html   (every change on one board)
+python3 scripts/ticket_board.py build /path/to/project <change-id>
+# → .dsh/baton/<change-id>/board.html
+# <change-id> is optional for build/scan when the project has exactly one
+# change — the common day-one case — and the omission fails loud (naming the
+# dir or the candidates) on zero or several.
+```
+
+Clicking a card shows the copy-paste `check` / `uncheck` commands (runnable
+from any directory); a flip rewrites any built board in place — just reload
+the page.
+
+**Standalone coordination kernel**: `scripts/queue.py` runs without the baton
+session — wrap any shell command in a resource gate,
+submit background jobs, freeze resources, and audit everything. State lives
+in one SQLite store (default `~/.baton/coordination/queue.db`, `--db` to
+override):
+
+| Verb | What it does |
+|---|---|
+| `exec --resource R [--resource R2 …] -- <cmd>` | claim the resources (exclusive), wait for the lease, run `<cmd>`, exit with its exit code; identical owner+command+resource submissions collapse onto one job |
+| `submit <spec.json>` | submit a multi-stage background job from a JSON spec (shape mirrors `Job.from_dict`); prints the persisted job id |
+| `status` (`--resource R` / `--job J` / `--status S`) | one-line-per-job summary, one resource's leases + waiters, or full job detail + events |
+| `cancel <job> [--force]` | cancel a queued job; running jobs need `--force` (signals the owner process group and releases the lease) |
+| `freeze R` / `unfreeze R` | stop granting new leases on a resource / reverse it |
+| `declare R [--capacity N] [--mode exclusive\|capacity\|shared]` | annotate a resource's capacity and claim mode up front instead of relying on the lazy capacity=1 default |
+| `gate --resource R [--drain-check CMD] -- <cmd>` | freeze the resources, wait until every in-flight lease is gone and the optional check exits 0, run the disruptive command, then unfreeze in a `finally`; on drain timeout exits 124 without running the command |
+| `events [--job J] [--type T] [--limit N]` | dump the audit log as JSON |
+| `reap [--dry-run] [--lease-ttl S]` | scan heartbeat-expired leases and route stale jobs per the guardian contract |
+
+The headline is the drain barrier: a disruptive command (migration, reindex)
+stops racing other users of the resource — new claimants queue while in-flight
+leases finish, and the barrier always unfreezes, even when the command fails:
+
+```bash
+python3 scripts/queue.py gate --resource db:prod --reason "schema migration" \
+  -- ./migrate.sh
+```
+
+## Bundle contents
+
+| Path | Purpose |
+|---|---|
+| `index.js` | mounts the bundled `skills/` provider |
+| `cordis.patch.yml` | DSH bundle insert row (`dsh-openspec-baton`) |
+| `.zcode-plugin/plugin.json` | ZCode plugin manifest (same skill) |
+| `skills/baton/SKILL.md` | the `baton` skill (actions -> subagent -> reconcile) |
+| `scripts/session_control.py` | the control-plane CLI (`actions`/`bind`/`reconcile`/`status`/`cleanup`) |
+| `scripts/` | deterministic controller, plan store, receipts, queue CLI |
+
+## History
+
+Baton v1 drove an external `ralph.sh` loop. v2 brought the loop into Python.
+v3 replaced the subprocess model with subagents but still used a shared PRD +
+`passes` flags. v4 retired the PRD/passes protocol and made
+`SessionController` the sole deterministic scheduler. v5 adopted
+OpenSpec as the single plan face - the change's `tasks.md` is the ticket source
+(section-order DAG, `[x]` write-back), and the self-built cognitive/amendment
+engines are retired. **v6 (current)** drops the local MCP adapter: the CLI is
+the only control surface while the plugin is still iterating.
+
+## Requirements
+
+- **DSH** `0.2.1-rc.2` or newer, with `subagent` available (`dsh-base`)
+- **Python 3.10+** (`python3` on macOS/Linux, `python` on Windows, or
+  `BATON_PYTHON`) + pytest
+- A **git** target project (the controller prepares isolated worktrees)
+- The target project uses **OpenSpec** (`openspec/changes/<id>/tasks.md`)
+
+## Regression
+
+The standard regression entry - full pytest suite (incl. temp-git-fixture
+e2e), a live CLI smoke test, and a docs/file consistency
+check:
+
+```bash
+./tests/regression.sh
+```
+
+## Documentation
+
+- [docs/architecture.md](docs/architecture.md) - why the deterministic control plane is the core IP
+- [docs/ticket-format.md](docs/ticket-format.md) - the OpenSpec change -> ticket mapping spec
+
+## License
+
+MIT
