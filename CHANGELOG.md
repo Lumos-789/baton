@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.0 (2026-11-04)
+
+Baton is one product again: the ticket/DAG control plane. Two things that were
+not part of it left the repository.
+
+- **The generic resource queue moved out.** `scripts/queue.py`,
+  `scripts/coordination/` and their five test files (3.1k lines of code, 2.9k of
+  tests, 45% of the Python in this repo) implemented resource mutex, capacity
+  and drain barriers — a separate product that the controller never imports.
+  It now lives in the local `baton-queue` project; this bundle no longer ships
+  it, and the skill no longer documents the `queue` verbs.
+- **The repository's own OpenSpec change is gone.** `openspec/` held the design
+  change for a past release of baton itself; `docs/architecture.md` carries the
+  current design, so the change file only repeated it.
+
 ## 0.2.2 (2026-11-04)
 
 Four CLI reliability fixes found by running the real commands. No protocol or

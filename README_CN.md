@@ -148,17 +148,6 @@ python3 scripts/ticket_board.py build /path/to/project <change-id>
 # -> .dsh/baton/<change-id>/board.html
 ```
 
-**独立协同内核**：`scripts/queue.py` 不依赖 baton 会话 — 把任意 shell
-命令包进资源闸门、提交后台任务、冻结资源、全量审计。状态在一个 SQLite 库
-（默认 `~/.baton/coordination/queue.db`，`--db` 可覆盖）。核心是排空屏障
-（drain barrier）：破坏性命令（迁移、重建索引）与资源上的其他使用者不再竞速 —
-新的认领排队，在飞租约跑完，屏障始终会解冻：
-
-```bash
-python3 scripts/queue.py gate --resource db:prod --reason "schema migration" \
-  -- ./migrate.sh
-```
-
 ## 包内容
 
 | 路径 | 用途 |
@@ -168,7 +157,7 @@ python3 scripts/queue.py gate --resource db:prod --reason "schema migration" \
 | `.zcode-plugin/plugin.json` | ZCode 插件清单（同一技能） |
 | `skills/baton/SKILL.md` | `baton` 技能（actions -> subagent -> reconcile） |
 | `scripts/session_control.py` | 控制面 CLI（`actions`/`bind`/`reconcile`/`status`/`cleanup`） |
-| `scripts/` | 确定性控制器、计划存储、回执、队列 CLI |
+| `scripts/` | 确定性控制器、计划存储、回执 |
 
 ## 回归
 

@@ -173,33 +173,6 @@ Clicking a card shows the copy-paste `check` / `uncheck` commands (runnable
 from any directory); a flip rewrites any built board in place — just reload
 the page.
 
-**Standalone coordination kernel**: `scripts/queue.py` runs without the baton
-session — wrap any shell command in a resource gate,
-submit background jobs, freeze resources, and audit everything. State lives
-in one SQLite store (default `~/.baton/coordination/queue.db`, `--db` to
-override):
-
-| Verb | What it does |
-|---|---|
-| `exec --resource R [--resource R2 …] -- <cmd>` | claim the resources (exclusive), wait for the lease, run `<cmd>`, exit with its exit code; identical owner+command+resource submissions collapse onto one job |
-| `submit <spec.json>` | submit a multi-stage background job from a JSON spec (shape mirrors `Job.from_dict`); prints the persisted job id |
-| `status` (`--resource R` / `--job J` / `--status S`) | one-line-per-job summary, one resource's leases + waiters, or full job detail + events |
-| `cancel <job> [--force]` | cancel a queued job; running jobs need `--force` (signals the owner process group and releases the lease) |
-| `freeze R` / `unfreeze R` | stop granting new leases on a resource / reverse it |
-| `declare R [--capacity N] [--mode exclusive\|capacity\|shared]` | annotate a resource's capacity and claim mode up front instead of relying on the lazy capacity=1 default |
-| `gate --resource R [--drain-check CMD] -- <cmd>` | freeze the resources, wait until every in-flight lease is gone and the optional check exits 0, run the disruptive command, then unfreeze in a `finally`; on drain timeout exits 124 without running the command |
-| `events [--job J] [--type T] [--limit N]` | dump the audit log as JSON |
-| `reap [--dry-run] [--lease-ttl S]` | scan heartbeat-expired leases and route stale jobs per the guardian contract |
-
-The headline is the drain barrier: a disruptive command (migration, reindex)
-stops racing other users of the resource — new claimants queue while in-flight
-leases finish, and the barrier always unfreezes, even when the command fails:
-
-```bash
-python3 scripts/queue.py gate --resource db:prod --reason "schema migration" \
-  -- ./migrate.sh
-```
-
 ## Bundle contents
 
 | Path | Purpose |
@@ -209,7 +182,7 @@ python3 scripts/queue.py gate --resource db:prod --reason "schema migration" \
 | `.zcode-plugin/plugin.json` | ZCode plugin manifest (same skill) |
 | `skills/baton/SKILL.md` | the `baton` skill (actions -> subagent -> reconcile) |
 | `scripts/session_control.py` | the control-plane CLI (`actions`/`bind`/`reconcile`/`status`/`cleanup`) |
-| `scripts/` | deterministic controller, plan store, receipts, queue CLI |
+| `scripts/` | deterministic controller, plan store, receipts |
 
 ## History
 

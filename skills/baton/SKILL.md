@@ -1,6 +1,6 @@
 ---
 name: baton
-description: baton 接力调度——用确定性 ticket/DAG 控制面执行已批准的 OpenSpec change。当用户说「跑 baton」「跑一下 baton」「baton status」「baton queue」「用 baton 排活」「派活」「派发任务」「把这个 OpenSpec change 跑完」或问 baton 能不能排活时使用；本地 CLI 返回确定 actions，会话派发给隔离 worktree 子代理，验证全绿的密封回执才算完成。Also use when the user says "run baton", "baton status", "baton queue", or wants an OpenSpec change executed with verified integration.
+description: baton 接力调度——用确定性 ticket/DAG 控制面执行已批准的 OpenSpec change。当用户说「跑 baton」「跑一下 baton」「baton status」「用 baton 排活」「派活」「派发任务」「把这个 OpenSpec change 跑完」或问 baton 能不能排活时使用；本地 CLI 返回确定 actions，会话派发给隔离 worktree 子代理，验证全绿的密封回执才算完成。Also use when the user says "run baton", "baton status", or wants an OpenSpec change executed with verified integration.
 whenToUse: The user mentions baton in any phrasing (跑 baton / baton status / 排活 / 派活 / dispatch) or wants an approved OpenSpec change executed, inspected, or queued in a git project.
 ---
 
@@ -41,8 +41,6 @@ plan revision.
   `<project path>/openspec/changes/<change-id>/`.
 - `status <project path> <change-id>` - read-only snapshot via
   `<cli> <project path> <change-id> status`.
-- `queue <...>` - generic resource-queue CLI
-  (`<baton-root>/scripts/queue.py`).
 - No subcommand -> defaults to `run`.
 
 `<baton-root>` is the directory containing this bundle's `package.json` (two
@@ -188,40 +186,6 @@ force-removes a dirty worktree (it skips it and reports). `--dry-run` lists
 the matched worktrees (`wouldRemove`) without removing anything. A change-id
 that never ran (typo) fails with `no baton worktrees or branches found`
 instead of an empty success.
-
-## Queue
-
-Generic resource-queue CLI: wrap a command into a single-stage job, claim a
-resource, and run serially over the coordination kernel.
-
-```bash
-<python> <baton-root>/scripts/queue.py exec --resource workspace:/path/to/proj -- <command...>
-<python> <baton-root>/scripts/queue.py status --resource workspace:/path/to/proj
-<python> <baton-root>/scripts/queue.py reap
-```
-
-## Concurrency-blocking items - declare / gate
-
-When flows run concurrently over shared infrastructure, every
-**concurrency-blocking item** gets an explicit control surface. Three verbs,
-one per role:
-
-| Verb | Role | Semantics |
-|---|---|---|
-| `declare` | identify / annotate | State the resource exists and its capacity up front. |
-| `exec --resource` | claim | Normal steps claim units; oversubscribed claimants wait. |
-| `gate` | control disruption | Drain barrier for deploy/push/restart: freeze -> wait for in-flight leases -> optional `--drain-check` -> run -> unfreeze in `finally`. |
-
-```bash
-<python> <baton-root>/scripts/queue.py declare replay-suite --capacity 5 --reason "SUT concurrency ceiling"
-<python> <baton-root>/scripts/queue.py exec --resource replay-suite -- run_replays.py 238 --yes
-<python> <baton-root>/scripts/queue.py gate --resource replay-suite --drain-check "<python> check_no_running_runs.py" -- git push origin dev-001
-```
-
-Freeze blocks new claims but never kills in-flight leases; waiters stay
-`submitted`; a drain timeout exits 124 without running the command. The
-coordination DB is per machine (`~/.baton/coordination/queue.db`), so
-cross-machine coordination needs a shared `--drain-check` truth source.
 
 ## OpenSpec change -> ticket mapping
 

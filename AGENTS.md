@@ -34,8 +34,6 @@ cognitive state machine on the active path.
 | `scripts/orchestration/session_model.py` | action batch models (dispatch/recover/resolve_merge/wait/blocked/complete) + Task Packet finalization |
 | `scripts/receipt.py` | subagent-facing `verify`/`seal` CLI — the only accepted success evidence |
 | `scripts/session_control.py` | **the control-plane CLI** over `SessionController` (actions/bind/reconcile/status/cleanup) — the only adapter surface |
-| `scripts/queue.py` | generic resource-queue CLI (exec/submit/status/cancel/freeze/events/reap) over `coordination/` |
-| `scripts/coordination/` | scheduling core: queue model, SQLite store, scheduler, lease runner |
 | `scripts/ticket_board.py` | static HTML board generator over OpenSpec changes (zero process, zero port) |
 | `templates/` | ticket board HTML template |
 | `docs/` | design documents |
