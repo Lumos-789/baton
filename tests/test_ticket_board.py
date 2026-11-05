@@ -230,6 +230,23 @@ def test_uncheck_dry_run_mirrors_not_checked_error(tmp_path, capsys):
     assert "not checked" in json.loads(capsys.readouterr().out)["error"]
 
 
+def test_uncheck_preserves_crlf_through_the_reverse_command(tmp_path, capsys):
+    """The documented ``reverse`` of the write-back must be byte-faithful.
+
+    ``uncheck`` used to read/write through universal-newline text I/O, so one
+    flip rewrote a whole Windows checkout to LF.
+    """
+    project = _project(tmp_path)
+    tasks = project / "openspec" / "changes" / "demo" / "tasks.md"
+    tasks.write_bytes(b"# Tasks: demo\r\n\r\n## 1. Seed\r\n\r\n- [x] 1.1 seed\r\n")
+    capsys.readouterr()
+
+    rc = ticket_board.main(["ticket_board", "uncheck", str(project), "demo", "1.1"])
+
+    assert rc == 0
+    assert tasks.read_bytes() == b"# Tasks: demo\r\n\r\n## 1. Seed\r\n\r\n- [ ] 1.1 seed\r\n"
+
+
 def test_uncheck_flips_uppercase_x_the_parser_tolerates(tmp_path, capsys):
     """`_ticket.py` maps hand-written ``[X]`` to resolved; uncheck must undo it."""
     project = _project(tmp_path)

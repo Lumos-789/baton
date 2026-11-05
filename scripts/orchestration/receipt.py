@@ -263,7 +263,12 @@ def seal_receipt(packet_path: str | Path) -> ResultEnvelope:
     if not base:
         raise ReceiptError("packet has no base SHA")
     if head == base:
-        raise ReceiptError("HEAD did not advance from the assignment baseline")
+        raise ReceiptError(
+            "HEAD did not advance from the assignment baseline — commit the "
+            "ticket's work. If the ticket legitimately changes no files (a "
+            "verification/decision-only task), record that explicitly with "
+            "`git commit --allow-empty -m \'<what you verified>\'`"
+        )
     _run_git(worktree, ["merge-base", "--is-ancestor", base, head])
     verification = _run_verification_commands(worktree, task.verification_commands)
     changed = [

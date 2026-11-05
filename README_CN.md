@@ -41,8 +41,7 @@ OpenSpec 是计划面。**
 
 Baton 是一个 DSH bundle：一个包挂载 `baton` 技能，执行通过内置的 Python CLI
 （`scripts/session_control.py`）完成。要求 DSH `0.2.1-rc.2` 或更新、提供
-`subagent` 工具的 profile（自带的 `dsh-base` 即可）、PATH 上有 Python 3.10+
-（或用 `BATON_PYTHON` 指定）。
+`subagent` 工具的 profile（自带的 `dsh-base` 即可）、PATH 上有 Python 3.10+。
 
 ```bash
 # 从 checkout 安装
@@ -181,8 +180,7 @@ CLI 是唯一的控制面。
 ## 要求
 
 - **DSH** `0.2.1-rc.2` 或更新，且 `subagent` 可用（`dsh-base`）
-- **Python 3.10+**（macOS/Linux 上的 `python3`、Windows 上的 `python`，或用
-  `BATON_PYTHON` 指定）+ pytest
+- **Python 3.10+**（macOS/Linux 上的 `python3`、Windows 上的 `python`）+ pytest
 - 一个 **git** 目标仓库（控制器要在其中准备隔离 worktree）
 - 目标项目使用 **OpenSpec**（`openspec/changes/<id>/tasks.md`）
 

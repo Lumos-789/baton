@@ -189,10 +189,43 @@ def test_status_verb_reports_fresh_run_snapshot(tmp_path, capsys):
     }
     assert payload["ok"] is True
     assert payload["runId"] == "RUN-real-change"
-    assert payload["revision"] == 1
+    # 0 means "no plan revision recorded yet" — status must not create one.
+    assert payload["revision"] == 0
     assert payload["complete"] is False
     assert payload["missingRequiredTickets"] == ["1.1"]
     assert payload["attempts"] == []
+
+
+def test_status_verb_writes_nothing(tmp_path, capsys):
+    """A read verb must not leave a plan store, revisions or plan.json behind."""
+    repo = _make_repo(tmp_path)
+    _add_change(repo, "real-change")
+
+    assert session_control.main([str(repo), "real-change", "status"]) == 0
+    assert session_control.main([str(repo), "real-change", "status"]) == 0
+    capsys.readouterr()
+
+    assert not (repo / ".dsh").exists()
+
+    # After a real run, status reads the existing state without adding to it.
+    controller = session_control.SessionController(
+        str(repo), "real-change", verification_commands=["true"]
+    )
+    controller.actions("s1", capacity=1)
+    revisions_before = controller.store.events()
+    plan_before = (repo / ".dsh" / "baton" / "real-change" / "plan.json").read_text(
+        encoding="utf-8"
+    )
+
+    assert session_control.main([str(repo), "real-change", "status"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["revision"] == 1
+    assert controller.store.events() == revisions_before
+    plan_after = (repo / ".dsh" / "baton" / "real-change" / "plan.json").read_text(
+        encoding="utf-8"
+    )
+    assert plan_after == plan_before
 
 
 def test_status_verb_typoed_change_id_is_one_json_line(tmp_path, capsys):
@@ -208,6 +241,8 @@ def test_status_verb_typoed_change_id_is_one_json_line(tmp_path, capsys):
     assert "tasks.md not found" in payload["error"]
     assert payload["command"] == "status"
     assert out.err == ""
+    # A failed read must not leave a runtime directory for the typo'd feature.
+    assert not (repo / ".dsh").exists()
 
 
 def test_status_verb_shape_equals_controller_status(tmp_path, capsys):

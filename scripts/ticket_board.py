@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import shlex
 import sys
 from pathlib import Path
@@ -38,6 +37,7 @@ from _ticket import (  # noqa: E402
     TasksMarkdownError,
     check_task,
     parse_tasks_md,
+    uncheck_task,
     validate_change_id,
 )
 from _frontier import compute_frontier  # noqa: E402
@@ -271,15 +271,10 @@ def set_task_checked(
         except TasksMarkdownError as exc:
             return {"error": str(exc)}
         return {"task": task_id, "action": "checked", "reverse": reverse}
-    # uncheck: rewrite [x]/[X] back to [ ] (the parser tolerates hand-written [X])
-    text = tasks_path.read_text(encoding="utf-8")
-    pattern = re.compile(
-        r"^([-*+]\s*\[)[xX](\]\s+" + re.escape(task_id) + r"(?:\s|$))", re.MULTILINE
-    )
-    new_text, count = pattern.subn(r"\g<1> \g<2>", text)
-    if count == 0:
-        return {"error": f"task {task_id} is not checked"}
-    tasks_path.write_text(new_text, encoding="utf-8")
+    try:
+        uncheck_task(tasks_path, num)
+    except TasksMarkdownError as exc:
+        return {"error": str(exc)}
     return {"task": task_id, "action": "unchecked", "reverse": reverse}
 
 

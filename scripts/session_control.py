@@ -70,7 +70,8 @@ def _ok(value: object) -> dict[str, object]:
     return {"ok": True, **value} if isinstance(value, dict) else {"ok": True}
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI surface — also the contract the docs are checked against."""
     parser = argparse.ArgumentParser(description="Baton session control")
     parser.add_argument("project")
     parser.add_argument("feature")
@@ -140,6 +141,11 @@ def main(argv: list[str] | None = None) -> int:
         help="recorded in the attempt's failure_code / event log",
     )
 
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
     try:
         if args.command == "cleanup":

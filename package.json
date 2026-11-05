@@ -1,6 +1,6 @@
 {
   "name": "dsh-openspec-baton",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Deterministic ticket/DAG/subagent control plane over OpenSpec changes: one DSH bundle mounts the baton skill; the deterministic controller is driven through a local Python CLI.",
   "type": "module",
   "main": "index.js",

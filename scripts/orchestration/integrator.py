@@ -95,17 +95,82 @@ def _integration_lock(path: Path) -> Iterator[None]:
             pass
 
 
+def _conflict_files(path: Path) -> list[str]:
+    result = _git(path, ["diff", "--name-only", "--diff-filter=U"])
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def _merge_head(path: Path) -> str:
+    """The commit a preserved (unresolved) merge is merging, or ``''``.
+
+    Git writes ``MERGE_HEAD`` for the whole duration of a conflicted merge, so
+    its presence is the authoritative "this worktree is mid-merge" signal.
+    """
+    result = _git(path, ["rev-parse", "-q", "--verify", "MERGE_HEAD"])
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _branch_tip(path: Path, branch: str) -> str:
+    result = _git(path, ["rev-parse", "-q", "--verify", branch])
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _dirty_files(path: Path) -> list[str]:
+    """Tracked files with uncommitted changes (untracked files are ignored)."""
+    result = _git(path, ["status", "--porcelain", "--untracked-files=no"])
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def _not_merged(reason: str, files: list[str]) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "reason": reason,
+        "already_merged": False,
+        "integration_sha": "",
+        "conflicts": files,
+    }
+
+
 def integrate_assignment(
     integration_path: str | Path,
     assignment_branch: str,
 ) -> dict[str, Any]:
-    """Merge ``assignment_branch`` and preserve conflicts for a repair action."""
+    """Merge ``assignment_branch`` into the shared integration worktree.
+
+    Returns ``ok=True`` with the new ``integration_sha``, or ``ok=False`` with
+    a ``reason`` the controller must distinguish:
+
+    - ``conflict``: *this* branch conflicted; the conflict is preserved in the
+      worktree and needs a ``resolve_merge`` action.
+    - ``merge-in-progress``: the worktree is already mid-merge for **another**
+      assignment. Nothing was attempted; try again after that one is resolved.
+      (Git refuses a second merge while ``MERGE_HEAD`` exists, and its unmerged
+      path list belongs to the earlier merge — reporting it as this branch's
+      conflict would mis-attribute the failure and hand two solvers the same
+      worktree.)
+    - ``worktree-dirty``: tracked files in the shared worktree have
+      uncommitted changes, so a merge could destroy them. Nothing was
+      attempted.
+    """
     path = Path(integration_path).resolve()
     with _integration_lock(path):
         return _integrate_locked(path, assignment_branch)
 
 
 def _integrate_locked(path: Path, assignment_branch: str) -> dict[str, Any]:
+    merge_head = _merge_head(path)
+    if merge_head:
+        # A preserved conflict blocks every other merge. ``MERGE_HEAD`` is the
+        # tip of the branch being merged, which tells us whether the pending
+        # merge belongs to this assignment or to a different one.
+        if merge_head == _branch_tip(path, assignment_branch):
+            return _not_merged("conflict", _conflict_files(path))
+        return _not_merged("merge-in-progress", _conflict_files(path))
+
+    dirty = _dirty_files(path)
+    if dirty:
+        return _not_merged("worktree-dirty", dirty)
+
     if branch_is_merged(path, assignment_branch, "HEAD"):
         head = _git(path, ["rev-parse", "HEAD"])
         return {
@@ -127,18 +192,9 @@ def _integrate_locked(path: Path, assignment_branch: str) -> dict[str, Any]:
             "conflicts": [],
         }
 
-    conflicts = _git(path, ["diff", "--name-only", "--diff-filter=U"])
-    conflict_files = [
-        line.strip() for line in conflicts.stdout.splitlines() if line.strip()
-    ]
+    conflict_files = _conflict_files(path)
     if conflict_files:
-        return {
-            "ok": False,
-            "already_merged": False,
-            "integration_sha": "",
-            "conflicts": conflict_files,
-            "error": "merge-conflict",
-        }
+        return _not_merged("conflict", conflict_files)
     raise WorktreeError(
         result.stderr.strip() or result.stdout.strip() or "git merge failed"
     )

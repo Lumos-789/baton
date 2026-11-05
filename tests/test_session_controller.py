@@ -19,6 +19,7 @@ from orchestration.session_controller import (  # noqa: E402
     SessionController,
     SessionControllerError,
 )
+from orchestration.worktree import WorktreeError  # noqa: E402
 
 FIXTURES = Path(__file__).parent / "fixtures" / "sample-change"
 
@@ -475,3 +476,130 @@ def test_no_verification_commands_fails_loud_instead_of_defaulting(tmp_path):
         controller.actions("session-a", capacity=1)
 
     assert controller.store.run_verification_commands() == []
+
+
+def _seal_all(assignments) -> None:
+    for action in assignments:
+        worktree = Path(action.cwd)
+        _git(worktree, "add", "-A")
+        _git(worktree, "commit", "-m", f"ticket {action.ticket_num}")
+        seal_receipt(action.packet_path)
+
+
+def test_conflict_is_attributed_only_to_the_conflicting_assignment(tmp_path):
+    """One real conflict must not mark every pending assignment conflicted.
+
+    ``git merge`` refuses to start while a preserved conflict exists, and its
+    unmerged path list belongs to the earlier merge. Treating that as "this
+    branch conflicts" produced a second ``resolve_merge`` action pointing at a
+    conflict the branch never touched — and two solvers in one worktree.
+    """
+    project = _project(tmp_path)
+    controller = _controller(project)
+    dispatches = _dispatches(controller.actions("session-a", capacity=2))
+    by_ticket = {action.ticket_num: action for action in dispatches}
+    integration = Path(
+        json.loads(Path(by_ticket[201].packet_path).read_text(encoding="utf-8"))[
+            "integrationPath"
+        ]
+    )
+
+    (integration / "base.txt").write_text("from integration\n", encoding="utf-8")
+    _git(integration, "add", "-A")
+    _git(integration, "commit", "-m", "integration side")
+    (Path(by_ticket[201].cwd) / "base.txt").write_text("from 201\n", encoding="utf-8")
+    (Path(by_ticket[202].cwd) / "only202.txt").write_text("202\n", encoding="utf-8")
+    _seal_all(dispatches)
+
+    batch = controller.actions("session-a", capacity=2)
+
+    merges = [action for action in batch.actions if action.kind == "resolve_merge"]
+    assert [action.assignment_id for action in merges] == [
+        by_ticket[201].assignment_id
+    ]
+    assert controller.store.get_execution_attempt(
+        by_ticket[202].assignment_id
+    ).state not in {"blocked-review"}
+    assert not (integration / "only202.txt").exists()
+
+    # Resolving the single real conflict lets both assignments land.
+    (integration / "base.txt").write_text("resolved\n", encoding="utf-8")
+    _git(integration, "add", "-A")
+    _git(integration, "commit", "--no-edit")
+
+    controller.actions("session-a", capacity=2)
+
+    assert (
+        controller.store.get_execution_attempt(by_ticket[201].assignment_id).state
+        == "succeeded"
+    )
+    assert controller.store.get_execution_attempt(
+        by_ticket[202].assignment_id
+    ).state == "succeeded"
+    assert (integration / "only202.txt").exists()
+
+
+def test_dirty_integration_worktree_blocks_without_wedging(tmp_path):
+    """A half-finished resolve_merge leaves the worktree dirty.
+
+    That used to raise ``WorktreeError`` from every ``actions`` call while the
+    attempt sat in ``integrating`` until its two-hour lease expired.
+    """
+    project = _project(tmp_path)
+    controller = _controller(project)
+    action = _dispatches(controller.actions("session-a", capacity=1))[0]
+    integration = Path(
+        json.loads(Path(action.packet_path).read_text(encoding="utf-8"))[
+            "integrationPath"
+        ]
+    )
+    (Path(action.cwd) / "base.txt").write_text("assignment\n", encoding="utf-8")
+    _seal_all([action])
+
+    (integration / "base.txt").write_text("uncommitted local edit\n", encoding="utf-8")
+
+    batch = controller.actions("session-a", capacity=1)
+
+    blocked = [item for item in batch.actions if item.kind == "blocked"]
+    assert batch.state == "blocked"
+    assert [item.code for item in blocked] == ["integration-worktree-dirty"]
+    assert "abandon" in blocked[0].reason
+    attempt = controller.store.get_execution_attempt(action.assignment_id)
+    assert attempt.state != "integrating"
+
+    # Cleaning the worktree (as the message instructs) lets the merge proceed.
+    (integration / "base.txt").write_text("base\n", encoding="utf-8")
+
+    controller.actions("session-a", capacity=1)
+
+    assert (
+        controller.store.get_execution_attempt(action.assignment_id).state
+        == "succeeded"
+    )
+
+
+def test_hard_integration_failure_is_reported_and_leaves_no_wedge(
+    tmp_path, monkeypatch
+):
+    """A merge that fails without conflict files must not strand the attempt."""
+    import orchestration.session_controller as session_controller
+
+    project = _project(tmp_path)
+    controller = _controller(project)
+    action = _dispatches(controller.actions("session-a", capacity=1))[0]
+    (Path(action.cwd) / "ticket.txt").write_text("done\n", encoding="utf-8")
+    _seal_all([action])
+
+    def boom(*args, **kwargs):
+        raise WorktreeError("fatal: refusing to merge unrelated histories")
+
+    monkeypatch.setattr(session_controller, "integrate_assignment", boom)
+
+    batch = controller.actions("session-a", capacity=1)
+
+    blocked = [item for item in batch.actions if item.kind == "blocked"]
+    assert [item.code for item in blocked] == ["integration-failed"]
+    assert "abandon" in blocked[0].reason
+    attempt = controller.store.get_execution_attempt(action.assignment_id)
+    assert attempt.state == "blocked-review"
+    assert attempt.failure_code.startswith("integration-failed")

@@ -49,7 +49,7 @@ face.**
 Baton is a DSH bundle: one package mounts the `baton` skill. Execution goes
 through the bundled Python CLI (`scripts/session_control.py`). It requires DSH
 `0.2.1-rc.2` or newer, a profile that provides the `subagent` tool (the shipped
-`dsh-base` does), and Python 3.10+ on `PATH` (or `BATON_PYTHON` pointing at it).
+`dsh-base` does), and Python 3.10+ on `PATH`.
 
 ```bash
 # From a checkout
@@ -213,8 +213,7 @@ the only control surface while the plugin is still iterating.
 ## Requirements
 
 - **DSH** `0.2.1-rc.2` or newer, with `subagent` available (`dsh-base`)
-- **Python 3.10+** (`python3` on macOS/Linux, `python` on Windows, or
-  `BATON_PYTHON`) + pytest
+- **Python 3.10+** (`python3` on macOS/Linux, `python` on Windows) + pytest
 - A **git** target project (the controller prepares isolated worktrees)
 - The target project uses **OpenSpec** (`openspec/changes/<id>/tasks.md`)
 

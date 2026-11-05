@@ -57,8 +57,8 @@ secret).
 
 ### Why leases are fixed at 7200 s
 
-A claim's lease is hardcoded to **7200 s (2 h)** — there is no CLI flag and no
-renewal entry point. `expire_execution_attempts()` runs before every batch: an
+A claim's lease is **7200 s (2 h)** — there is no CLI flag and no renewal entry
+point (the constructor takes an override, used by tests only). `expire_execution_attempts()` runs before every batch: an
 attempt whose lease ran out is marked `unknown` with
 `failure_code=lease-expired`, and its ticket is claimable again on that same
 `actions()` call (the retry supersedes the stale attempt). A ticket that

@@ -1,5 +1,82 @@
 # Changelog
 
+## 0.3.2 (2026-11-05)
+
+Correctness round over the integration path, plus the leftovers of the 0.3.0
+queue extraction. Every item below was reproduced against a real git repo
+before it was fixed, and each fix carries a regression test.
+
+- **A preserved merge conflict no longer contaminates other assignments.**
+  `git merge` refuses to start while a conflicted merge is preserved, and
+  `git diff --diff-filter=U` lists the *earlier* merge's files. The old code
+  read that as "this branch conflicts", so one real conflict marked every
+  other pending receipt `blocked-review` and emitted a second `resolve_merge`
+  pointing at a conflict the branch never touched — two solvers, one shared
+  worktree. `integrate_assignment` now returns a reason:
+  `conflict` (this branch, `MERGE_HEAD` is its own tip), `merge-in-progress`
+  (another assignment owns the worktree: nothing attempted, the attempt is
+  left untouched and retried later), `worktree-dirty`, or a raised
+  `WorktreeError` for a merge that cannot run at all.
+- **A dirty integration worktree no longer wedges the run.** An uncommitted
+  tracked change there used to make every `actions` call raise `WorktreeError`
+  while the attempt sat in `integrating` until its two-hour lease expired. It
+  is now a `blocked` action (`integration-worktree-dirty`) naming the files and
+  the `abandon` escape; the attempt keeps its lease and is retried as soon as
+  the worktree is clean.
+- **Hard merge failures no longer strand the attempt.** A merge that fails
+  without conflict files parks the attempt in `blocked-review`
+  (`failure_code=integration-failed: …`) and surfaces a `blocked` action
+  instead of leaving it in `integrating`.
+- **`status` is genuinely read-only.** It used to create `.dsh/baton/`, the
+  database and revision 1, and rewrite `plan.json` on every call — and a
+  mistyped change-id left a runtime directory behind. `PlanStore.snapshot()`
+  reads the existing store (if any) and writes nothing; `revision: 0` now means
+  "no plan revision recorded yet".
+- **`ticket_board uncheck` no longer rewrites a CRLF file.** It is the
+  documented `reverse` of baton's own `[x]` write-back, but it read/wrote
+  through universal-newline text I/O and wrote non-atomically, so one flip
+  turned a Windows checkout into a whole-file diff. The flip moved into
+  `_ticket.uncheck_task`, the exact mirror of `check_task` (same checkbox
+  tolerance, same `newline=""` byte-preserving `tmp` + rename write).
+- **Dead code removed** after the 0.3.0 queue extraction: the resource-lease
+  subsystem (`attempt_resource_leases` table + index, claim-time insert loop,
+  four deletes, `_attempt_resources_locked`) and the `assignments` table —
+  neither had a producer, since the tasks.md parser never fills `resources`,
+  `priority`, `agent_profile`, `authority`, `successor` or `source_amendment`.
+  `PlanTicket` is down to the fields the parser actually produces,
+  `TaskPacket.resources` is gone with its only writer, and the pre-0.3.1
+  "adopt verification commands from existing packets" path is removed.
+- **`plan_store.py` split** (1262 → 434 lines): `store_base.py` (errors,
+  terminal states, atomic JSON write), `store_schema.py` (DDL + WAL retry),
+  `attempt_store.py` (claim/lease/bind/state/finalize mixin, importing
+  `store_base` only, so the dependency stays one-way).
+- **Docs corrected.** `BATON_PYTHON` was documented in README, README_CN and
+  the skill but read by no code — removed. `plan.json` is described as what it
+  is (a live projection rewritten per claim; the immutable revision history is
+  in `queue.db`), and the lease wording admits the constructor override.
+- **New drift tripwire** (`tests/test_doc_cli_contract.py`): every CLI
+  invocation in README / README_CN / SKILL.md / architecture.md is parsed and
+  checked against the real argparse tree — the verb must be registered and each
+  flag must belong to it. The stage-5 docs gate only checked that *paths*
+  exist, which is why the 0.3.0 skill could teach a nonexistent `run` verb.
+  Verified to fail on exactly that bug. `session_control.build_parser()` was
+  extracted so the test reads the real parser instead of a copy.
+
+Migration notes:
+
+- Receipts and packets are unaffected; a **packet prepared by 0.3.1** contains
+  the removed `resources` field, so its task-packet hash no longer matches.
+  An attempt mid-flight across the upgrade is reported as
+  `receipt-invalid: task packet hash mismatch` — `abandon` it (or let the next
+  `actions` retry) and it re-dispatches with a fresh packet.
+- `plan.json` no longer carries an `assignments` array (it was written but
+  never read; live attempt state is in `queue.db`).
+- `status` reports `revision: 0` until a run records its first revision.
+
+Regression: 179 tests pass; `./tests/regression.sh` 5/5 stages green (was 156;
+the additions are the new conflict/worktree/read-only-status/doc-contract/
+CRLF cases).
+
 ## 0.3.1 (2026-11-05)
 
 Five release blockers found by an extended verification round. The sealed

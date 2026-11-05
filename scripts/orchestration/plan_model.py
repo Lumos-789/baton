@@ -41,13 +41,6 @@ class PlanTicket:
     criteria: list[str] = field(default_factory=list)
     required: bool = True
     source_revision: int = 1
-    source_amendment: str = ""
-    successor: int | None = None
-    priority: str = "normal"
-    priority_reason: str = ""
-    agent_profile: str = ""
-    resources: list[str] = field(default_factory=list)
-    authority: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PlanTicket":
@@ -60,45 +53,6 @@ class PlanTicket:
             criteria=[str(x) for x in data.get("criteria", [])],
             required=bool(data.get("required", True)),
             source_revision=int(data.get("source_revision", 1)),
-            source_amendment=str(data.get("source_amendment", "")),
-            successor=(
-                int(data["successor"])
-                if data.get("successor") is not None
-                else None
-            ),
-            priority=str(data.get("priority", "normal")),
-            priority_reason=str(data.get("priority_reason", "")),
-            agent_profile=str(data.get("agent_profile", "")),
-            resources=[str(x) for x in data.get("resources", [])],
-            authority=[str(x) for x in data.get("authority", [])],
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass
-class AssignmentSnapshot:
-    """Immutable assignment metadata captured by a plan revision."""
-
-    assignment_id: str
-    ticket_num: int
-    state: str
-    plan_revision: int
-    task_packet_hash: str
-    profile: str = ""
-    resources: list[str] = field(default_factory=list)
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "AssignmentSnapshot":
-        return cls(
-            assignment_id=str(data["assignment_id"]),
-            ticket_num=int(data["ticket_num"]),
-            state=str(data["state"]),
-            plan_revision=int(data["plan_revision"]),
-            task_packet_hash=str(data["task_packet_hash"]),
-            profile=str(data.get("profile", "")),
-            resources=[str(x) for x in data.get("resources", [])],
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -118,7 +72,6 @@ class PlanRevision:
     approved_at: str
     created_at: str
     tickets: list[PlanTicket] = field(default_factory=list)
-    assignments: list[AssignmentSnapshot] = field(default_factory=list)
     completion_state: str = "active"
 
     @classmethod
@@ -137,10 +90,6 @@ class PlanRevision:
             approved_at=str(data.get("approved_at", "")),
             created_at=str(data.get("created_at", "")),
             tickets=[PlanTicket.from_dict(x) for x in data.get("tickets", [])],
-            assignments=[
-                AssignmentSnapshot.from_dict(x)
-                for x in data.get("assignments", [])
-            ],
             completion_state=str(data.get("completion_state", "active")),
         )
 
@@ -155,19 +104,16 @@ class PlanRevision:
             "approved_at": self.approved_at,
             "created_at": self.created_at,
             "tickets": [t.to_dict() for t in self.tickets],
-            "assignments": [a.to_dict() for a in self.assignments],
             "completion_state": self.completion_state,
         }
 
     def hashable_dict(self) -> dict[str, Any]:
         data = self.to_dict()
         data["plan_hash"] = ""
-        data["assignments"] = []
         return data
 
 
 __all__ = [
-    "AssignmentSnapshot",
     "PlanRevision",
     "PlanTicket",
     "stable_hash",

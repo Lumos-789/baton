@@ -21,6 +21,7 @@ from orchestration.result import ResultEnvelope
 from orchestration.worktree import cleanup_feature_worktrees
 from orchestration.session_model import (
     ActionBatch,
+    BaseAction,
     BlockedAction,
     CompleteAction,
     DispatchAction,
@@ -289,22 +290,24 @@ class SessionController:
         }
 
     def status(self) -> dict[str, Any]:
-        """Return a read-only snapshot from the durable session state."""
-        plan = self.store.current_plan()
-        completion = self.store.latest_completion()
-        attempts = self.store.list_execution_attempts()
+        """Return a read snapshot — this creates no plan revision and no files.
+
+        ``revision`` is 0 until the first ``actions`` call records a revision,
+        so "never ran" is distinguishable from "ran and progressed".
+        """
+        snapshot = self.store.snapshot()
         return {
             "ok": True,
             "runId": f"RUN-{self.feature}",
             "feature": self.feature,
             "projectPath": str(self.project_path),
-            "revision": plan.revision,
-            "complete": bool(completion["complete"]),
+            "revision": snapshot["revision"],
+            "complete": bool(snapshot["complete"]),
             "missingRequiredTickets": [
                 f"{num // 100}.{num % 100}"
-                for num in completion["missingRequiredTickets"]
+                for num in snapshot["missingRequiredTickets"]
             ],
-            "attempts": [attempt.to_dict() | {"claim_token": ""} for attempt in attempts],
+            "attempts": snapshot["attempts"],
         }
 
     def reconcile(
@@ -355,10 +358,6 @@ class SessionController:
         stored = self.store.run_verification_commands()
         if stored:
             return stored
-        inherited = self._commands_from_existing_packets()
-        if inherited:
-            self.store.set_run_verification_commands(inherited)
-            return inherited
         if self.store.latest_completion()["complete"]:
             return []
         raise SessionControllerError(
@@ -366,22 +365,6 @@ class SessionController:
             'pass --verify "<command>" on actions (or reconcile) — it is persisted '
             "for every packet in the run"
         )
-
-    def _commands_from_existing_packets(self) -> list[str]:
-        """Adopt the commands of an in-flight run created before persistence."""
-        for attempt in self.store.list_execution_attempts():
-            if not attempt.packet_path or not Path(attempt.packet_path).is_file():
-                continue
-            try:
-                payload = json.loads(
-                    Path(attempt.packet_path).read_text(encoding="utf-8")
-                )
-            except (OSError, json.JSONDecodeError):
-                continue
-            raw = payload.get("taskPacket", {}).get("verification_commands")
-            if isinstance(raw, list) and raw:
-                return [str(command) for command in raw]
-        return []
 
     def _successor_with_sealed_receipt(
         self, attempt: ExecutionAttempt, attempts: list[ExecutionAttempt]
@@ -431,7 +414,6 @@ class SessionController:
                 dependencies=[f"ticket-{num:03d}" for num in ticket.blocked_by],
                 base_commit=attempt.base_sha,
                 project_path=str(slot.path),
-                resources=list(ticket.resources),
                 verification_commands=list(verification_commands),
                 output_contract=["sealed receipt"],
                 plan_revision=attempt.plan_revision,
@@ -505,7 +487,7 @@ class SessionController:
 
     def _reconcile_sealed(
         self, attempt: ExecutionAttempt, claim_token: str
-    ) -> ResolveMergeAction | None:
+    ) -> BaseAction | None:
         receipt_path = Path(attempt.receipt_path)
         try:
             payload = json.loads(receipt_path.read_text(encoding="utf-8"))
@@ -523,11 +505,27 @@ class SessionController:
             raise SessionControllerError(
                 f"sealed receipt rejected for {attempt.assignment_id}: {exc}"
             ) from exc
-        self.store.mark_execution_attempt_state(
-            attempt.assignment_id, claim_token, "integrating"
-        )
-        result = integrate_assignment(attempt.integration_path, attempt.worktree_branch)
-        if not result["ok"]:
+        try:
+            result = integrate_assignment(
+                attempt.integration_path, attempt.worktree_branch
+            )
+        except WorktreeError as exc:
+            return self._integration_failed(attempt, claim_token, str(exc))
+
+        if result["ok"]:
+            self.store.mark_execution_attempt_state(
+                attempt.assignment_id, claim_token, "integrating"
+            )
+            self.store.finalize_execution_attempt(
+                attempt.assignment_id,
+                claim_token,
+                envelope,
+                str(result["integration_sha"]),
+            )
+            return None
+
+        reason = result.get("reason")
+        if reason == "conflict":
             self.store.mark_execution_attempt_state(
                 attempt.assignment_id,
                 claim_token,
@@ -535,13 +533,65 @@ class SessionController:
                 failure_code="merge-conflict",
             )
             return self._merge_action(attempt, claim_token, result.get("conflicts", []))
-        self.store.finalize_execution_attempt(
-            attempt.assignment_id,
-            claim_token,
-            envelope,
-            str(result["integration_sha"]),
+        if reason == "merge-in-progress":
+            # The shared worktree is mid-merge for a *different* assignment.
+            # Leave this attempt untouched: it is retried on the next call,
+            # once that conflict is resolved, and must not be reported as
+            # conflicted itself.
+            return None
+        if reason == "worktree-dirty":
+            return BlockedAction(
+                code="integration-worktree-dirty",
+                ticket_num=attempt.ticket_num,
+                reason=self._dirty_worktree_reason(attempt, result.get("conflicts", [])),
+            )
+        raise SessionControllerError(
+            f"integration returned an unknown outcome {reason!r} for "
+            f"{attempt.assignment_id}"
         )
-        return None
+
+    def _integration_failed(
+        self, attempt: ExecutionAttempt, claim_token: str, detail: str
+    ) -> BlockedAction:
+        """Surface a hard integration failure without wedging the attempt.
+
+        The attempt moves to ``blocked-review`` (still active, so no retry
+        churn) instead of being left in ``integrating`` until its lease runs
+        out two hours later.
+        """
+        failure_code = f"integration-failed: {detail}"
+        try:
+            self.store.mark_execution_attempt_state(
+                attempt.assignment_id,
+                claim_token,
+                "blocked-review",
+                failure_code=failure_code,
+            )
+        except ExecutionAttemptError:
+            pass
+        return BlockedAction(
+            code="integration-failed",
+            ticket_num=attempt.ticket_num,
+            reason=(
+                f"cannot merge {attempt.worktree_branch} into "
+                f"{attempt.integration_path}: {detail}. Nothing was merged. Fix the "
+                f"integration worktree, or retire the attempt with "
+                f"`abandon {attempt.assignment_id}`."
+            ),
+        )
+
+    @staticmethod
+    def _dirty_worktree_reason(
+        attempt: ExecutionAttempt, dirty: list[str]
+    ) -> str:
+        listing = ", ".join(dirty[:5]) or "unknown files"
+        return (
+            f"integration worktree {attempt.integration_path} has uncommitted "
+            f"changes ({listing}) and nothing was merged. Commit or discard them "
+            f"(or `git -C <path> merge --abort` if a merge is half done), then "
+            f"call actions again; to retire this attempt instead, "
+            f"`abandon {attempt.assignment_id}`."
+        )
 
     @staticmethod
     def _check_receipt_identity(

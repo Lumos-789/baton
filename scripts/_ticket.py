@@ -209,6 +209,39 @@ def check_task(path: str | Path, num: int) -> None:
     tmp.replace(path)
 
 
+def uncheck_task(path: str | Path, num: int) -> None:
+    """Flip task ``num`` back to unchecked ``[ ]`` in tasks.md (the reverse).
+
+    The exact mirror of :func:`check_task`: same checkbox tolerance
+    (``[x]``/``[X]``/``[ x ]``), same byte-preserving atomic ``tmp`` + rename
+    write and the same ``newline=""`` read so a CRLF checkout keeps its line
+    endings. ``ticket_board uncheck`` is the documented ``reverse`` of baton's
+    own ``[x]`` write-back, so it must not turn one flip into a whole-file diff.
+
+    Raises:
+        TasksMarkdownError: file missing or the task is not currently checked.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise TasksMarkdownError(f"OpenSpec tasks.md not found: {path}")
+    task_id = f"{num // 100}.{num % 100}"
+    with open(path, encoding="utf-8", newline="") as handle:
+        text = handle.read()
+    pattern = re.compile(
+        r"^([-*+][ \t]*\[)[ \t]*[xX][ \t]*(\][ \t]+"
+        + re.escape(task_id)
+        + r"(?:\s|$))",
+        re.MULTILINE,
+    )
+    new_text, count = pattern.subn(r"\g<1> \g<2>", text)
+    if count == 0:
+        raise TasksMarkdownError(f"task {task_id} is not checked in {path}")
+    tmp = path.with_suffix(".md.tmp")
+    with open(tmp, "w", encoding="utf-8", newline="") as handle:
+        handle.write(new_text)
+    tmp.replace(path)
+
+
 __all__ = [
     "TasksMarkdownError",
     "Ticket",
@@ -216,4 +249,5 @@ __all__ = [
     "check_task",
     "parse_tasks_md",
     "task_num",
+    "uncheck_task",
 ]

@@ -3,11 +3,19 @@
 This folder contains the local control-plane primitives for Baton.
 
 - `plan_model.py` defines the shared plan data contracts (`PlanTicket`,
-  `AssignmentSnapshot`, `PlanRevision`) and the `utc_now`/`stable_hash`
-  helpers used across the durable store.
-- `plan_store.py` owns versioned persistence, SQLite event logging, and the
-  sync from the OpenSpec change's `tasks.md` into plan revisions (edits and
-  baton's own `[x]` write-backs each produce a new revision).
+  `PlanRevision`) and the `utc_now`/`stable_hash` helpers used across the
+  durable store.
+- `plan_store.py` owns versioned persistence, SQLite event logging, the
+  run-wide verification settings, sealed result envelopes, completion facts,
+  the read-only `snapshot()` behind `status`, and the sync from the OpenSpec
+  change's `tasks.md` into plan revisions (edits and baton's own `[x]`
+  write-backs each produce a new revision).
+- `attempt_store.py` is the attempt lifecycle mixin of `PlanStore` (claim,
+  lease + expiry, agent binding, state transitions, finalize). It imports
+  `store_base` only — never `plan_store` — so the dependency stays one-way.
+- `store_base.py` holds the store errors/terminal states and the atomic JSON
+  write helper shared by both modules.
+- `store_schema.py` holds the `queue.db` DDL and its WAL busy-retry loop.
 - `session_controller.py` is the deterministic session-subagent state machine:
   actions, native-agent binding, sealed-receipt reconciliation, integration,
   recovery, and latest-plan completion. This is the **sole** execution

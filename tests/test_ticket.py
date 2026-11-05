@@ -8,6 +8,7 @@ Covers:
 - section-order DAG: task N.M blocked by all tasks of earlier sections
 - error paths: missing file, no sections, no tasks, duplicate ids, misfiled ids
 - check_task: flip [ ]→[x], idempotency, unknown task
+- uncheck_task: the reverse flip — same tolerance, same byte-preserving write
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from _ticket import (  # noqa: E402
     check_task,
     parse_tasks_md,
     task_num,
+    uncheck_task,
     validate_change_id,
 )
 
@@ -198,3 +200,64 @@ def test_validate_change_id_rejects_unsafe_segments(change_id):
 @pytest.mark.parametrize("change_id", ["feature", "add-login", "wave_2.v1"])
 def test_validate_change_id_accepts_single_segments(change_id):
     assert validate_change_id(change_id) == change_id
+
+
+def test_uncheck_task_flips_back_and_reports_when_not_checked(tmp_path):
+    path = _write(tmp_path, SAMPLE)
+    uncheck_task(path, 101)
+    assert {t.task_id: t.status for t in parse_tasks_md(path)}["1.1"] == "ready"
+    # Second call is not a silent no-op: the task is no longer checked.
+    with pytest.raises(TasksMarkdownError, match="task 1.1 is not checked"):
+        uncheck_task(path, 101)
+
+
+def test_uncheck_task_unknown_num_raises(tmp_path):
+    path = _write(tmp_path, SAMPLE)
+    with pytest.raises(TasksMarkdownError, match="task 4.2 is not checked"):
+        uncheck_task(path, 402)
+
+
+def test_uncheck_task_preserves_surrounding_lines(tmp_path):
+    path = _write(tmp_path, SAMPLE)
+    before = path.read_text(encoding="utf-8").splitlines()
+    uncheck_task(path, 202)
+    after = path.read_text(encoding="utf-8").splitlines()
+    assert len(before) == len(after)
+    assert [(b, a) for b, a in zip(before, after) if b != a] == [
+        ("* [X] 2.2 second build done", "* [ ] 2.2 second build done")
+    ]
+
+
+def test_uncheck_task_preserves_crlf_line_endings(tmp_path):
+    """The reverse flip must not rewrite a Windows checkout to LF.
+
+    ``ticket_board uncheck`` is the documented ``reverse`` of baton's own
+    write-back, so it has to preserve every byte the forward flip preserves.
+    """
+    path = tmp_path / "tasks.md"
+    original = b"# Tasks: demo\r\n\r\n## 1. A\r\n\r\n- [x] 1.1 done\r\n"
+    path.write_bytes(original)
+    uncheck_task(path, 101)
+    assert (
+        path.read_bytes() == b"# Tasks: demo\r\n\r\n## 1. A\r\n\r\n- [ ] 1.1 done\r\n"
+    )
+
+
+def test_uncheck_task_leaves_no_temp_file_behind(tmp_path):
+    path = _write(tmp_path, SAMPLE)
+    uncheck_task(path, 101)
+    assert not path.with_suffix(".md.tmp").exists()
+
+
+@pytest.mark.parametrize("checkbox", ["- [x] ", "* [X] ", "+ [ x ] ", "-\t[x] "])
+def test_uncheck_task_matches_the_checkbox_forms_the_parser_accepts(
+    tmp_path, checkbox
+):
+    path = tmp_path / "tasks.md"
+    path.write_text(f"## 1. A\n\n{checkbox}1.1 done\n", encoding="utf-8")
+    assert [t.status for t in parse_tasks_md(path)] == ["resolved"]
+    uncheck_task(path, 101)
+    assert [t.status for t in parse_tasks_md(path)] == ["ready"]
+    # check_task can flip it forward again: the two are exact mirrors.
+    check_task(path, 101)
+    assert [t.status for t in parse_tasks_md(path)] == ["resolved"]

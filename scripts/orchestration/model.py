@@ -32,7 +32,7 @@ class TaskPacket:
     judged (``acceptance_criteria`` / ``verification_commands`` /
     ``output_contract``), what it depends on (``dependencies`` /
     ``base_commit`` / ``artifacts``), where it may touch (``project_path`` /
-    ``allowed_paths`` / ``resources``), and how the orchestrator should
+    ``allowed_paths``), and how the orchestrator should
     behave on ambiguity (``retry_policy``). ``plan_revision`` binds the
     packet to the Live Plan revision that produced it; ``task_packet_hash``
     is the canonical content hash callers use for idempotency.
@@ -47,7 +47,6 @@ class TaskPacket:
     artifacts: list[str] = field(default_factory=list)
     project_path: str = ""
     allowed_paths: list[str] = field(default_factory=list)
-    resources: list[str] = field(default_factory=list)
     verification_commands: list[str] = field(default_factory=list)
     output_contract: list[str] = field(default_factory=list)
     retry_policy: str = "manual-on-ambiguous"
@@ -66,7 +65,6 @@ class TaskPacket:
             artifacts=[str(x) for x in data.get("artifacts", [])],
             project_path=str(data.get("project_path", "")),
             allowed_paths=[str(x) for x in data.get("allowed_paths", [])],
-            resources=[str(x) for x in data.get("resources", [])],
             verification_commands=[str(x) for x in data.get("verification_commands", [])],
             output_contract=[str(x) for x in data.get("output_contract", [])],
             retry_policy=str(data.get("retry_policy", "manual-on-ambiguous")),

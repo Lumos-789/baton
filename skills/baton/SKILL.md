@@ -21,7 +21,7 @@ levels above this `SKILL.md`). Relative doc paths below are written against that
 root, not the skill directory.
 
 `<python>` is a Python 3.10+ interpreter: `python3` on macOS/Linux, `python` on
-Windows, or the `BATON_PYTHON` override.
+Windows.
 
 `<cli>` is `<python> <baton-root>/scripts/session_control.py`. Every verb prints
 one JSON object to stdout and exits non-zero on a domain failure (one JSON error
@@ -155,9 +155,14 @@ claimable again on the next `actions` call. The command prints `destroys` /
 ```
 
 Returns `{ok, runId, revision, complete, feature, projectPath,
-missingRequiredTickets:["2.1","3.2"], attempts:[...]}`. Completion comes from
-the plan store's required-ticket check against the latest plan revision — not
-from any PRD `passes` flags.
+missingRequiredTickets:["2.1","3.2"], attempts:[...]}`.
+
+`status` writes nothing: it creates no plan revision, no runtime directory and
+no `plan.json`, so it is safe on a project that never ran (and on a mistyped
+change-id, which still fails loud with the missing-tasks.md error). `revision:
+0` therefore means "no plan revision recorded yet"; the first `actions` call
+creates revision 1. Completion comes from the plan store's required-ticket
+check against the latest plan revision — not from any PRD `passes` flags.
 
 ## Editing the plan (live plan)
 
@@ -210,7 +215,25 @@ and must not be used to judge completion.
   the assignment worktree, or `abandon` and let the next `actions` claim fresh.
 - **A `resolve_merge` action appeared** → two assignments touched overlapping
   files; the conflict is preserved in the integration worktree. Resolve it in a
-  subagent, then reconcile again.
+  subagent, then reconcile again. Only the assignment whose branch owns the
+  preserved merge gets this action; other pending receipts keep waiting (they
+  are not marked conflicted, and nothing merges into a worktree that is already
+  mid-merge).
+- **`blocked: integration-worktree-dirty`** → the shared integration worktree
+  has uncommitted tracked changes (typically a half-finished conflict
+  resolution). Nothing was merged. Commit or discard them there, then call
+  `actions` again. The attempt keeps its lease, so it is retried once the
+  worktree is clean; `abandon <assignment_id>` retires it instead.
+- **`blocked: integration-failed`** → the merge could not run at all (for
+  example unrelated histories). Nothing was merged and the attempt is parked in
+  `blocked-review` instead of sitting in `integrating` until its lease expires.
+  Fix the integration worktree, then `actions` again, or `abandon`.
+- **`HEAD did not advance from the assignment baseline`** → the subagent
+  committed nothing. If the ticket genuinely changes no files (a verification
+  or decision-only task), have it record that with an explicit empty commit
+  (`git commit --allow-empty -m "<what you verified>"`); the sealed receipt then
+  carries `changed_files: []` and the packet's verification commands are still
+  what decides success.
 - **`capacity > 5` rejected** → the controller caps concurrency at 5.
 - **A sealed receipt is not semantic correctness**: it binds the packet hash,
   claim token, a clean advanced HEAD, the exit codes and the changed-file list
