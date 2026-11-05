@@ -18,6 +18,8 @@
     "docs/",
     "assets/",
     "README.md",
+    "README_CN.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "dsh": {
