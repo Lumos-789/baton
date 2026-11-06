@@ -152,10 +152,23 @@ SessionController (the sole deterministic scheduler)
   is no CLI flag and no renewal entry point. A lease that runs out is judged
   `lease-expired` (the attempt flips to `unknown` with that `failure_code`) and
   the ticket is re-dispatched by the next `actions` call.
-- **Operator escape hatch** - `abandon <assignment_id>` retires a stuck
-  attempt: it releases the lease and drops the attempt's eligibility for
-  reconcile, while its worktree, branch, commits, packet and receipt stay on
-  disk for audit.
+- **Operator escape hatches, both guarded** - `abandon <assignment_id>` retires
+  a stuck attempt: it releases the lease and drops the attempt's eligibility
+  for reconcile, while its worktree, branch, commits, packet and receipt stay
+  on disk for audit. Abandoning an attempt that is plausibly still working
+  (active, no failure evidence, no receipt, less than 80% of its lease spent)
+  is refused with the judgment data unless `--force` - so a session taking
+  over a run cannot silently destroy live work. `adopt <assignment_id>` is the
+  reverse hatch: an abandoned attempt whose sealed receipt arrived late is
+  re-verified and integrated instead of thrown away (a newer sealed successor
+  refuses the adopt and lists both evidence sets for a human choice).
+- **Relay-safe judgments** - `status` shows per attempt a `relay` block:
+  `elapsedSec` / `leaseRemainingSec` / `leaseElapsedFraction`,
+  `receiptExists`, worktree liveness signals and a `suggestedAction`
+  (`wait` / `reconcile` / `adopt` / ...). The dispatch prompt tells subagents
+  to refresh a `progress` heartbeat in the run directory (outside the
+  worktree, so it never dirties a seal), and `status` reports its age -
+  "alive" is read from data, not guessed.
 
 **Control plane**:
 - **OpenSpec-native cognitive phase** - "use baton to finish X" means the
@@ -196,7 +209,7 @@ the page.
 | `cordis.patch.yml` | DSH bundle insert row (`dsh-openspec-baton`) |
 | `.zcode-plugin/plugin.json` | ZCode plugin manifest (same skill) |
 | `skills/baton/SKILL.md` | the `baton` skill (actions -> subagent -> reconcile) |
-| `scripts/session_control.py` | the control-plane CLI (`actions`/`bind`/`reconcile`/`status`/`cleanup`/`abandon`) |
+| `scripts/session_control.py` | the control-plane CLI (`actions`/`bind`/`reconcile`/`status`/`cleanup`/`abandon`/`adopt`) |
 | `scripts/` | deterministic controller, plan store, receipts |
 
 ## History

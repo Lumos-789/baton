@@ -132,7 +132,9 @@ def build_parser() -> argparse.ArgumentParser:
         "abandon",
         help="operator escape hatch: retire a stuck attempt (releases its lease, "
         "ignores future receipts); it does NOT delete the worktree, branch, "
-        "commits, packet or receipt",
+        "commits, packet or receipt; refused while the attempt is plausibly "
+        "still working (active + no failure evidence + most of its lease left) "
+        "unless --force",
     )
     abandon.add_argument("assignment_id")
     abandon.add_argument(
@@ -140,6 +142,19 @@ def build_parser() -> argparse.ArgumentParser:
         default="operator-abandoned",
         help="recorded in the attempt's failure_code / event log",
     )
+    abandon.add_argument(
+        "--force",
+        action="store_true",
+        help="bypass the live-attempt guard after reading its refusal data",
+    )
+
+    adopt = sub.add_parser(
+        "adopt",
+        help="revive an abandoned attempt whose sealed receipt arrived late: "
+        "re-verify the receipt and integrate it; refuses when a newer attempt "
+        "for the same ticket already sealed or is still in flight",
+    )
+    adopt.add_argument("assignment_id")
 
     return parser
 
@@ -168,7 +183,11 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "status":
             result = controller.status()
         elif args.command == "abandon":
-            result = controller.abandon(args.assignment_id, reason=args.reason)
+            result = controller.abandon(
+                args.assignment_id, reason=args.reason, force=args.force
+            )
+        elif args.command == "adopt":
+            result = controller.adopt(args.assignment_id)
         else:
             result = controller.reconcile(
                 args.assignment_id,

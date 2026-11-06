@@ -175,7 +175,7 @@ def test_documented_invocations_match_the_real_cli(doc):
 
 def test_skill_documents_every_verb_the_loop_needs():
     skill = (ROOT / "skills" / "baton" / "SKILL.md").read_text(encoding="utf-8")
-    for verb in ("actions", "bind", "reconcile", "status", "cleanup", "abandon"):
+    for verb in ("actions", "bind", "reconcile", "status", "cleanup", "abandon", "adopt"):
         assert f"| `{verb}" in skill, f"SKILL.md has no row for `{verb}`"
 
 

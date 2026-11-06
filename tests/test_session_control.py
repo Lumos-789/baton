@@ -439,3 +439,84 @@ def test_cli_abandon_clears_stuck_attempt_and_retry_reuses_persisted_verify(
     assert [item["ticket_num"] for item in dispatches] == [101]
     packet = json.loads(Path(dispatches[0]["packet_path"]).read_text(encoding="utf-8"))
     assert packet["taskPacket"]["verification_commands"] == ["test -f a.txt"]
+
+
+def test_cli_abandon_guard_refuses_live_attempt_one_json_line(tmp_path, capsys):
+    """Abandoning a plausibly-live attempt exits 1 with the judgment data."""
+    repo = _make_repo(tmp_path)
+    _add_change(repo, "real-change")
+    code = session_control.main(
+        [
+            str(repo),
+            "real-change",
+            "--verify",
+            "test -f a.txt",
+            "actions",
+            "--session-id",
+            "s1",
+        ]
+    )
+    assert code == 0
+    batch = json.loads(capsys.readouterr().out)
+    action = next(item for item in batch["actions"] if item["kind"] == "dispatch")
+
+    code = session_control.main(
+        [str(repo), "real-change", "abandon", action["assignment_id"]]
+    )
+
+    out = capsys.readouterr()
+    payload = json.loads(out.out)
+    assert code == 1
+    assert payload["command"] == "abandon"
+    assert "abandon refused" in payload["error"]
+    refusal = json.loads(payload["error"].split("abandon refused — ", 1)[1])
+    assert refusal["assignmentId"] == action["assignment_id"]
+    assert refusal["suggestedAction"] == "wait"
+    assert refusal["leaseRemainingSec"] > 7000
+    assert out.err == ""
+
+    code = session_control.main(
+        [
+            str(repo),
+            "real-change",
+            "abandon",
+            action["assignment_id"],
+            "--force",
+            "--reason",
+            "operator-verified-dead",
+        ]
+    )
+    forced = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert forced["state"] == "abandoned"
+    assert "adopt" in forced["destroys"]  # the escape now has a reverse hatch
+
+
+def test_cli_adopt_on_live_attempt_is_clean_error(tmp_path, capsys):
+    repo = _make_repo(tmp_path)
+    _add_change(repo, "real-change")
+    code = session_control.main(
+        [
+            str(repo),
+            "real-change",
+            "--verify",
+            "test -f a.txt",
+            "actions",
+            "--session-id",
+            "s1",
+        ]
+    )
+    assert code == 0
+    batch = json.loads(capsys.readouterr().out)
+    action = next(item for item in batch["actions"] if item["kind"] == "dispatch")
+
+    code = session_control.main(
+        [str(repo), "real-change", "adopt", action["assignment_id"]]
+    )
+
+    out = capsys.readouterr()
+    payload = json.loads(out.out)
+    assert code == 1
+    assert payload["command"] == "adopt"
+    assert "only abandoned" in payload["error"]
+    assert out.err == ""

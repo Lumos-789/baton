@@ -33,9 +33,10 @@ write the batch to `.dsh/baton/batch.json` and read that file.
 | `actions --session-id <id> [--capacity 1-5] [--base-branch main]` | claim + return an action batch. `--session-id` is **required** (no default). |
 | `bind <assignment_id> <claim_token> <agent_id>` | bind a spawned child to its assignment |
 | `reconcile <assignment_id> <claim_token> --agent-terminal completed\|failed\|canceled --session-id <id>` | turn a terminal event into a sealed receipt; returns the next batch |
-| `status` | read-only progress snapshot |
+| `status` | read-only progress snapshot (each attempt carries a `relay` judgment: elapsed / lease budget / receipt / liveness + `suggestedAction`) |
 | `cleanup [--include-integration] [--dry-run]` | remove a finished run's worktrees |
-| `abandon <assignment_id> [--reason "<why>"]` | retire a stuck attempt |
+| `abandon <assignment_id> [--reason "<why>"] [--force]` | retire a stuck attempt (guarded — refused while it is plausibly still working, see "Taking over a run") |
+| `adopt <assignment_id>` | revive an abandoned attempt whose sealed receipt arrived late: re-verify + integrate |
 
 `--verify "<cmd>"` is a **top-level** flag (before the verb, repeatable). The
 first claim **must** declare the change-wide verification commands: there is no
@@ -83,8 +84,8 @@ required task of the change is verified and integrated.
    - `recover` → no sealed receipt, so the outcome is unknown. A `lease-expired`
      recovery is retried automatically (the next claim supersedes the stale
      attempt and never blocks the frontier). Any other `recover` needs a
-     decision: retry/repair, or `abandon` if the attempt is stuck. **Never**
-     mark it succeeded.
+     decision: retry/repair, or `abandon` if the attempt is stuck (abandon is
+     guarded — see "Taking over a run"). **Never** mark it succeeded.
    - `blocked` → report the block code and reason; nothing to spawn.
    - `complete` → every required ticket has a verified, integrated receipt. Run
      `status` for the final summary and stop.
@@ -134,19 +135,72 @@ dirty worktree (it skips and reports). `--dry-run` lists what it would remove. A
 change-id that never ran fails with `no baton worktrees or branches found`
 instead of an empty success.
 
-### Abandon a stuck attempt
+### Taking over a run (relay)
+
+A handed-off run's subagents may still be working. A **clean worktree mid-ticket
+is normal** — the subagent flow is write → verify → commit → seal, so nothing is
+committed until the end — and a receipt only exists after that whole pipeline.
+"No receipt yet" inside the lease is not a death verdict; "the completion notice
+was lost" in a handoff note is an assumption, not evidence.
+
+Before judging any in-flight attempt, run `status` and read its `relay` block:
+`elapsedSec`, `leaseRemainingSec`, `leaseElapsedFraction`, `receiptExists`,
+worktree signals (`heartbeatAgeSec`, `lastActivityAgeSec`, `dirty`, `exists`)
+and the `suggestedAction`. Then follow it mechanically:
+
+- **`wait`** (active, lease healthy, no receipt, no failure evidence) → end the
+  turn and wait for the completion notice; `reconcile` only needs
+  `assignment_id` + `claim_token`, which the batch already gave you. Do not
+  abandon.
+- **`wait-lease-nearly-spent`** → keep waiting; the guard no longer applies but
+  an expired lease auto-recovers (the next `actions` supersedes the attempt and
+  re-dispatches).
+- **`reconcile`** (active attempt, sealed receipt on disk) → the notice may have
+  beaten you to it; reconcile or just run `actions` (it auto-reconciles sealed
+  receipts).
+- **`adopt`** (abandoned attempt, sealed receipt on disk) → the subagent
+  finished *after* a (mistaken) abandon. Run `adopt <assignment_id>`; it
+  re-verifies the receipt and integrates it. If a newer attempt for the same
+  ticket already sealed its own evidence, adopt refuses and lists both — pick
+  one deliberately (keep the successor, or abandon it and adopt the earlier
+  attempt). If a successor is still in flight, stop it first.
+- **`decide` / `resolve-or-abandon` / `await-expiry`** → the failure is already
+  on record (`unknown`, `blocked-review`, expired lease); treat as below.
+
+### Abandon a stuck attempt (guarded)
 
 ```bash
-<cli> "<project path>" <change-id> abandon <assignment_id> [--reason "<why>"]
+<cli> "<project path>" <change-id> abandon <assignment_id> [--reason "<why>"] [--force]
 ```
 
 The operator escape hatch for an attempt that can no longer progress (a
 non-retryable `recover`, or a receipt rejected as tampered). It **destroys** the
 attempt's lease and its eligibility for reconcile — any later receipt from that
-assignment is ignored. It **preserves** the worktree, branch, commits, packet and
-receipt on disk for audit; it reverts and merges nothing. The ticket becomes
-claimable again on the next `actions` call. The command prints `destroys` /
-`preserves` so the consequence is explicit.
+assignment is ignored unless explicitly revived with `adopt`. It **preserves**
+the worktree, branch, commits, packet and receipt on disk for audit; it reverts
+and merges nothing. The ticket becomes claimable again on the next `actions`
+call. The command prints `destroys` / `preserves` so the consequence is explicit.
+
+**Guard**: abandoning an attempt that is plausibly still working — active state,
+no failure evidence, no sealed receipt, less than 80% of its lease spent — is
+**refused** with the full judgment data (elapsed, lease remaining, liveness
+signals, advice). Read it, then either wait as advised or pass `--force`. The
+hatch stays free where it is actually needed: `unknown` outcomes,
+`blocked-review`, expired leases and terminal states are never guarded.
+
+### Adopt a late sealed receipt
+
+```bash
+<cli> "<project path>" <change-id> adopt <assignment_id>
+```
+
+The reverse hatch for the case abandon got wrong: the abandoned subagent turned
+out to be alive and sealed a valid receipt after the abandon. `adopt` fully
+re-verifies the receipt (body digest, claim token, packet hash, identity)
+*before* any state changes, then integrates it through the normal path — the
+ticket lands with zero re-work. A receipt that fails verification leaves the
+attempt abandoned. A merge conflict still parks the attempt in `blocked-review`
+and reports the follow-up, exactly like a normal reconcile.
 
 ## Status
 
@@ -155,7 +209,11 @@ claimable again on the next `actions` call. The command prints `destroys` /
 ```
 
 Returns `{ok, runId, revision, complete, feature, projectPath,
-missingRequiredTickets:["2.1","3.2"], attempts:[...]}`.
+missingRequiredTickets:["2.1","3.2"], attempts:[...]}`. Each attempt carries a
+`relay` block — the mechanical alive/dead judgment (`elapsedSec`,
+`leaseRemainingSec`, `leaseElapsedFraction`, `receiptExists`, worktree
+liveness signals, `suggestedAction`) that "Taking over a run" tells you to
+read before deciding to wait or to abandon.
 
 `status` writes nothing: it creates no plan revision, no runtime directory and
 no `plan.json`, so it is safe on a project that never ran (and on a mistyped
@@ -203,6 +261,11 @@ and must not be used to judge completion.
 
 ## Troubleshooting
 
+- **"No receipt + a clean worktree" reads like death** → it isn't: mid-flight
+  worktrees are clean by design (write → verify → commit → seal). Read
+  `status`'s `relay.suggestedAction`; inside the lease it says `wait`, and
+  `abandon` refuses without `--force`. A receipt that arrives *after* an
+  abandon can still be revived with `adopt`.
 - **Frontier empty** → are the target task's section predecessors all `[x]`? Is
   the task itself unchecked?
 - **An attempt is `unknown`** → the subagent finished without a sealed receipt,

@@ -26,6 +26,7 @@ cognitive state machine on the active path.
 | `scripts/_ticket.py` | **OpenSpec tasks.md parser** — change→feature, task `N.M`→ticket, section-order DAG, `[x]` write-back (spec: `docs/ticket-format.md`) |
 | `scripts/_frontier.py` | DAG + frontier (shared module) |
 | `scripts/orchestration/session_controller.py` | **SessionController** — the sole deterministic scheduler: actions, native-agent binding, sealed-receipt reconciliation, integration, recovery, latest-plan completion |
+| `scripts/orchestration/relay.py` | read-only relay judgments: elapsed vs lease budget, receipt existence, worktree/heartbeat liveness, suggested action, and the abandon guard verdict |
 | `scripts/orchestration/plan_store.py` | durable plan store (`queue.db`): plan revisions (synced from tasks.md edits), run settings, sealed result envelopes, completion facts, read-only `snapshot()` |
 | `scripts/orchestration/attempt_store.py` | attempt lifecycle mixin of `PlanStore`: claim, lease/expiry, agent binding, state transitions, finalize |
 | `scripts/orchestration/store_base.py` | plan-store errors, terminal-state constants and the atomic JSON write helper (shared by both store modules) |
@@ -36,7 +37,7 @@ cognitive state machine on the active path.
 | `scripts/orchestration/receipt.py` / `result.py` | sealed-receipt verify/seal core + `ResultEnvelope` (success evidence model) |
 | `scripts/orchestration/session_model.py` | action batch models (dispatch/recover/resolve_merge/wait/blocked/complete) + Task Packet finalization |
 | `scripts/receipt.py` | subagent-facing `verify`/`seal` CLI — the only accepted success evidence |
-| `scripts/session_control.py` | **the control-plane CLI** over `SessionController` (actions/bind/reconcile/status/cleanup/abandon) — the only adapter surface |
+| `scripts/session_control.py` | **the control-plane CLI** over `SessionController` (actions/bind/reconcile/status/cleanup/abandon/adopt) — the only adapter surface |
 | `scripts/ticket_board.py` | static HTML board generator over OpenSpec changes (zero process, zero port) |
 | `templates/` | ticket board HTML template |
 | `docs/` | design documents |
@@ -100,7 +101,7 @@ baton is a **living framework**, not a one-off deliverable. Any agent in any ses
 
 Baton generates the following in the **target business project** (not this repository) at runtime:
 - `<project>/.dsh/baton/queue.db` — durable plan store
-- `<project>/.dsh/baton/runs/<assignment_id>/{packet,verification,receipt}.json`
+- `<project>/.dsh/baton/runs/<assignment_id>/` — `packet.json` / `verification.json` / `receipt.json`, plus the optional `progress` heartbeat (a bare file, mtime-only, refreshed by the subagent outside every worktree)
 - `<project>/.dsh/baton/<change-id>/{plan.json,results/}` — live plan projection (rewritten per claim; the immutable revision history lives in `queue.db`) + result envelopes
 
 The plan face (`openspec/changes/<id>/tasks.md`) is written by the project's

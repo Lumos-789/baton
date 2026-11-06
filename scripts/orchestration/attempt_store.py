@@ -387,6 +387,48 @@ class AttemptStoreMixin:
             assignment_id, state="abandoned", failure_code=reason
         )
 
+    def adopt_execution_attempt(
+        self,
+        assignment_id: str,
+        *,
+        lease_seconds: int = 7200,
+    ) -> ExecutionAttempt:
+        """Revive an abandoned attempt so a late sealed receipt can reconcile.
+
+        The reverse hatch of :meth:`abandon_execution_attempt`: an abandoned
+        attempt whose subagent later sealed a valid receipt is put back into an
+        active state (``verifying``) with a fresh lease, so the controller can
+        verify and integrate the receipt as if the abandon never happened. The
+        caller is expected to hold the verified receipt; this transition only
+        changes scheduling state, never git.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = self._load_execution_attempt_locked(conn, assignment_id)
+            if row["state"] != "abandoned":
+                raise ExecutionAttemptError(
+                    f"cannot adopt {assignment_id} while it is {row['state']} "
+                    "(only abandoned attempts can be adopted)"
+                )
+            now = utc_now()
+            expires_at = _utc_after(lease_seconds)
+            conn.execute(
+                "UPDATE execution_attempts SET state = 'verifying', "
+                "failure_code = '', lease_expires_at = ?, updated_at = ? "
+                "WHERE job_id = ? AND assignment_id = ?",
+                (expires_at, now, self.job_id, assignment_id),
+            )
+            self._event_locked(
+                conn,
+                "execution.attempt.adopted",
+                {"assignmentId": assignment_id, "leaseExpiresAt": expires_at},
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return self.get_execution_attempt(assignment_id)
+
     def _resolve_execution_attempt(
         self,
         assignment_id: str,

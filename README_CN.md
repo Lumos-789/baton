@@ -135,8 +135,18 @@ SessionController（唯一确定性调度器）
 - **固定 7200 s 租约** — 认领的租约硬编码为 7200 s（2 小时）：没有 CLI 开关，
   也没有续租入口。租约超时即判 `lease-expired`（尝试翻成 `unknown` 并带上该
   `failure_code`），下一次 `actions` 调用会重新派发该 ticket。
-- **运维逃生口** — `abandon <assignment_id>` 退役卡住的尝试：释放租约、取消它
-  参与结算的资格，但 worktree、分支、提交、任务包和回执都留在磁盘上供审计。
+- **运维逃生口（双向带护栏）** — `abandon <assignment_id>` 退役卡住的尝试：释放
+  租约、取消它参与结算的资格，但 worktree、分支、提交、任务包和回执都留在磁盘
+  上供审计。对「可能还在干活」的尝试（在飞、无失败证据、无回执、租约消耗不足
+  80%）abandon 默认拒绝并给出判定数据，`--force` 才放行——接手会话无法再悄悄
+  销毁在飞的活。`adopt <assignment_id>` 是反向逃生口：abandon 之后迟到密封的
+  回执可被复活——重新验证后正常入账，不再整票作废（同票已有后继密封证据时
+  adopt 拒绝并列出两份证据，由人二选一）。
+- **接力判定可读** — `status` 为每个尝试输出 `relay` 块：`elapsedSec` /
+  `leaseRemainingSec` / `leaseElapsedFraction`、`receiptExists`、worktree
+  存活信号与 `suggestedAction`（`wait` / `reconcile` / `adopt` / …）。派发
+  prompt 要求子代理在 run 目录（worktree 之外，不会弄脏 seal）刷新
+  `progress` 心跳文件，`status` 汇报其年龄——「活着」从数据里读，不靠猜。
 
 **控制面**：
 - **OpenSpec 原生的认知阶段** — “用 baton 完成 X” 指先跑项目的 OpenSpec 工作流
@@ -165,7 +175,7 @@ python3 scripts/ticket_board.py build /path/to/project <change-id>
 | `cordis.patch.yml` | DSH bundle insert 行（`dsh-openspec-baton`） |
 | `.zcode-plugin/plugin.json` | ZCode 插件清单（同一技能） |
 | `skills/baton/SKILL.md` | `baton` 技能（actions -> subagent -> reconcile） |
-| `scripts/session_control.py` | 控制面 CLI（`actions`/`bind`/`reconcile`/`status`/`cleanup`/`abandon`） |
+| `scripts/session_control.py` | 控制面 CLI（`actions`/`bind`/`reconcile`/`status`/`cleanup`/`abandon`/`adopt`） |
 | `scripts/` | 确定性控制器、计划存储、回执 |
 
 ## 历史

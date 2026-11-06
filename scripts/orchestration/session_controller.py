@@ -17,6 +17,13 @@ from orchestration.plan_store import (
     TERMINAL_ATTEMPT_STATES,
 )
 from orchestration.receipt import ReceiptError, verify_sealed_receipt
+from orchestration.relay import (
+    HEARTBEAT_NAME,
+    abandon_refusal,
+    refusal_message,
+    relay_facts,
+    suggest_action,
+)
 from orchestration.result import ResultEnvelope
 from orchestration.worktree import cleanup_feature_worktrees
 from orchestration.session_model import (
@@ -269,9 +276,23 @@ class SessionController:
         return self.store.bind_attempt_agent(assignment_id, claim_token, agent_id)
 
     def abandon(
-        self, assignment_id: str, *, reason: str = "operator-abandoned"
+        self,
+        assignment_id: str,
+        *,
+        reason: str = "operator-abandoned",
+        force: bool = False,
     ) -> dict[str, Any]:
-        """Retire a stuck attempt and tell the operator exactly what that costs."""
+        """Retire a stuck attempt and tell the operator exactly what that costs.
+
+        Guarded: abandoning an attempt that is plausibly still working (active
+        state, no failure evidence, no sealed receipt, most of its lease left)
+        is refused with the judgment data — ``force=True`` bypasses the guard
+        for an operator who has looked at it.
+        """
+        attempt = self.store.get_execution_attempt(assignment_id)
+        refusal = None if force else abandon_refusal(attempt, relay_facts(attempt))
+        if refusal is not None:
+            raise SessionControllerError(refusal_message(refusal))
         attempt = self.store.abandon_execution_attempt(assignment_id, reason=reason)
         return {
             "assignmentId": attempt.assignment_id,
@@ -280,7 +301,8 @@ class SessionController:
             "failureCode": attempt.failure_code,
             "destroys": (
                 "this attempt's lease and its eligibility for reconcile; any "
-                "later receipt from it is ignored"
+                "later receipt from it is ignored unless explicitly revived "
+                "with `adopt`"
             ),
             "preserves": (
                 "the assignment worktree, branch, commits, packet and receipt "
@@ -289,13 +311,143 @@ class SessionController:
             "next": "the ticket can be claimed again by the next `actions` call",
         }
 
+    def adopt(self, assignment_id: str) -> dict[str, Any]:
+        """Revive an abandoned attempt whose sealed receipt arrived late.
+
+        The 2026-11-06 relay incident: an abandoned subagent finished and
+        sealed a valid receipt after the abandon, and the protocol threw the
+        evidence away — the ticket was rebuilt from scratch. ``adopt`` re-enters
+        the receipt into the normal verify → integrate path instead. The
+        receipt is fully re-verified (body digest, claim token, packet hash,
+        identity) *before* any state changes, and a newer attempt for the same
+        ticket with its own sealed evidence refuses the adopt: a human must
+        choose between the two.
+        """
+        attempt = self.store.get_execution_attempt(assignment_id)
+        if attempt.state != "abandoned":
+            raise SessionControllerError(
+                f"only abandoned attempts can be adopted; "
+                f"{assignment_id} is {attempt.state}"
+            )
+        if not attempt.receipt_path or not Path(attempt.receipt_path).is_file():
+            raise SessionControllerError(
+                f"no sealed receipt for {assignment_id} at "
+                f"{attempt.receipt_path or '<unset>'} — nothing to adopt; the "
+                "abandon stands"
+            )
+        successors = sorted(
+            (
+                candidate
+                for candidate in self.store.list_execution_attempts()
+                if candidate.ticket_num == attempt.ticket_num
+                and candidate.attempt > attempt.attempt
+            ),
+            key=lambda candidate: candidate.attempt,
+        )
+        sealed = [
+            candidate
+            for candidate in successors
+            if candidate.state == "succeeded"
+            or (
+                candidate.receipt_path
+                and Path(candidate.receipt_path).is_file()
+                and not candidate.failure_code.startswith("receipt-invalid")
+            )
+        ]
+        if sealed:
+            raise SessionControllerError(
+                f"cannot adopt {assignment_id}: a newer attempt for ticket "
+                f"{attempt.ticket_num} already has sealed evidence. Choose "
+                "one: keep the successor (do nothing), or abandon the "
+                "successor and adopt this one. Evidence: "
+                + "; ".join(
+                    f"{candidate.assignment_id} state={candidate.state} "
+                    f"commit={candidate.commit_sha or '?'} receipt={candidate.receipt_path}"
+                    for candidate in sealed
+                )
+                + f" — versus {assignment_id} receipt={attempt.receipt_path}"
+            )
+        in_flight = [
+            candidate
+            for candidate in successors
+            if candidate.state
+            in {"leased", "spawned", "running", "submitted", "verifying",
+                "integrating", "blocked-review"}
+        ]
+        if in_flight:
+            raise SessionControllerError(
+                f"cannot adopt {assignment_id}: a newer attempt for ticket "
+                f"{attempt.ticket_num} is still in flight ("
+                + ", ".join(
+                    f"{candidate.assignment_id} state={candidate.state}"
+                    for candidate in in_flight
+                )
+                + "). Stop it first (abandon it, or wait for its terminal "
+                "notice) so the ticket is not integrated twice."
+            )
+        token = self._token_from_packet(attempt.packet_path)
+        if not token:
+            raise SessionControllerError(
+                f"cannot read the claim token from packet {attempt.packet_path}; "
+                f"without it the receipt for {assignment_id} cannot be verified"
+            )
+        try:
+            payload = json.loads(
+                Path(attempt.receipt_path).read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SessionControllerError(
+                f"cannot read sealed receipt for {assignment_id}: {exc}"
+            ) from exc
+        try:
+            envelope = verify_sealed_receipt(
+                payload,
+                claim_token=token,
+                task_packet_hash=attempt.task_packet_hash,
+            )
+            self._check_receipt_identity(attempt, envelope)
+        except ReceiptError as exc:
+            raise SessionControllerError(
+                f"sealed receipt rejected for {assignment_id}, the attempt "
+                f"stays abandoned: {exc}"
+            ) from exc
+        revived = self.store.adopt_execution_attempt(
+            assignment_id, lease_seconds=self.lease_seconds
+        )
+        action = self._reconcile_sealed(revived, token)
+        final = self.store.get_execution_attempt(assignment_id)
+        return {
+            "assignmentId": assignment_id,
+            "ticketNum": attempt.ticket_num,
+            "state": final.state,
+            "adoptedFrom": "abandoned",
+            "commitSha": final.commit_sha,
+            "integrationSha": final.integration_sha,
+            "followUp": (
+                None
+                if action is None
+                else f"{action.kind} still required — handle it as `actions` "
+                "would (see the baton skill)"
+            ),
+        }
+
     def status(self) -> dict[str, Any]:
         """Return a read snapshot — this creates no plan revision and no files.
 
         ``revision`` is 0 until the first ``actions`` call records a revision,
-        so "never ran" is distinguishable from "ran and progressed".
+        so "never ran" is distinguishable from "ran and progressed". Each
+        attempt carries a ``relay`` block — the mechanical alive/dead judgment
+        (elapsed vs lease budget, receipt existence, worktree activity, and a
+        suggested action) a handing-off or taking-over session should read
+        before deciding to wait or to abandon.
         """
         snapshot = self.store.snapshot()
+        attempts: list[dict[str, Any]] = []
+        for row in snapshot["attempts"]:
+            attempt = ExecutionAttempt.from_dict(row)
+            facts = relay_facts(attempt)
+            row["relay"] = {"suggestedAction": suggest_action(attempt, facts), **facts}
+            attempts.append(row)
         return {
             "ok": True,
             "runId": f"RUN-{self.feature}",
@@ -307,7 +459,7 @@ class SessionController:
                 f"{num // 100}.{num % 100}"
                 for num in snapshot["missingRequiredTickets"]
             ],
-            "attempts": snapshot["attempts"],
+            "attempts": attempts,
         }
 
     def reconcile(
@@ -462,10 +614,14 @@ class SessionController:
         if not attempt.packet_path:
             raise SessionControllerError(f"attempt has no packet: {attempt.assignment_id}")
         receipt_cli = Path(__file__).resolve().parents[1] / "receipt.py"
+        heartbeat = Path(attempt.packet_path).parent / HEARTBEAT_NAME
         prompt = (
             f"Implement Baton assignment {attempt.assignment_id} only.\n"
             f"Work exclusively in `{attempt.worktree_path}` on branch "
             f"`{attempt.worktree_branch}`. Do not change ticket or controller state.\n"
+            f"Refresh the heartbeat file `{heartbeat}` after each meaningful "
+            f"milestone (overwrite or touch it; it lives outside the worktree, "
+            "so never commit it).\n"
             f"For change context, read `openspec/changes/{self.feature}/proposal.md` "
             f"and `tasks.md` in the worktree.\n"
             f"Read immutable packet `{attempt.packet_path}`. Implement the ticket, then run:\n"

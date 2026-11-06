@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.4.0 (2026-11-06)
+
+Relay-safety round: an in-flight attempt can no longer be silently destroyed
+by a mistaken abandon, and a late sealed receipt is no longer protocol debris.
+Born from the 2026-11-06 fusion-s1 incident — a taking-over session saw "no
+receipt + clean worktree" 14 minutes into a ~26-minute ticket under a 2-hour
+lease, declared the subagent dead and abandoned it; the subagent sealed a
+valid receipt 11 minutes later and the ticket was rebuilt from scratch. Every
+item below replays that incident in tests, at its exact parameters (14 min
+elapsed / 106 min remaining) and end-to-end.
+
+- **`status` now answers "is it alive?".** Each attempt carries a `relay`
+  block: `elapsedSec`, `leaseRemainingSec`, `leaseElapsedFraction`,
+  `receiptExists`, worktree liveness signals (`heartbeatAgeSec`,
+  `lastActivityAgeSec`, `dirty`, `exists`) and a `suggestedAction` (`wait`,
+  `wait-lease-nearly-spent`, `reconcile`, `adopt`, `decide`,
+  `resolve-or-abandon`, `await-expiry`, `none`). A clean worktree mid-ticket
+  is presented as the normal shape it is — the subagent flow is
+  write → verify → commit → seal — not as a death verdict.
+- **`abandon` is guarded.** Retiring an attempt that is plausibly still
+  working (active state, no failure evidence, no sealed receipt, lease less
+  than 80% spent) is refused with the full judgment data; `--force` bypasses
+  it for an operator who has read the refusal. The hatch stays free exactly
+  where it is needed: `unknown`, `blocked-review`, spent/expired leases and
+  terminal states are never guarded.
+- **`adopt <assignment_id>` is the reverse hatch.** An abandoned attempt whose
+  sealed receipt arrived late can be revived: the receipt is fully re-verified
+  (body digest, claim token, packet hash, identity) *before* any state
+  changes, then integrated through the normal path (a merge conflict still
+  parks in `blocked-review` with a follow-up). If a newer attempt for the
+  same ticket already sealed, adopt refuses and lists both evidence sets for
+  a human choice; if one is still in flight, adopt says so instead of
+  double-integrating.
+- **Heartbeat.** The dispatch prompt tells the subagent to refresh a
+  `progress` file in the run directory (outside the worktree, so it never
+  dirties a seal) after each milestone; `status` reports its age. Liveness
+  becomes observable, not inferred.
+- New read-only module `scripts/orchestration/relay.py`; `status` stays
+  fully read-only. Tests 179 → 196.
+
 ## 0.3.2 (2026-11-05)
 
 Correctness round over the integration path, plus the leftovers of the 0.3.0
