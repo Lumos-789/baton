@@ -18,11 +18,6 @@ from typing import Any
 ROLE_BUILDER = "builder"
 
 
-# ---------------------------------------------------------------------------
-# Task Packet — the immutable contract handed to a builder
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class TaskPacket:
     """The immutable, hashable-by-construction work contract handed to a

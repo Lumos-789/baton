@@ -96,7 +96,8 @@ self-built Grill/Brief/approval state machine.
 
 ```
 session_controller.py ──→ plan_store.py (durable: queue.db)
-   │   │   │
+   │   │   │   │
+   │   │   │   └──→ relay.py (read-only liveness judgments)
    │   │   └──→ integrator.py ──→ worktree.py (git)
    │   └──────→ receipt.py (verify/seal — the subagent CLI)
    └──────────→ session_model.py (action/attempt contracts)
@@ -108,6 +109,10 @@ session_control.py ──→ session_controller.py (thin CLI adapter)
 - `plan_store.py`: durable plan store (`queue.db`) — plan revisions (synced
   from tasks.md edits), execution attempts, leases, sealed receipts,
   completion facts.
+- `relay.py`: read-only relay judgments — elapsed vs the lease budget,
+  receipt existence, worktree/heartbeat liveness, the suggested action, and
+  the abandon guard verdict; feeds `status` and the abandon guard without
+  writing state.
 - `_ticket.py`: OpenSpec tasks.md parsing — the ticket source the plan store
   reads on every sync.
 - `_frontier.py`: DAG frontier — used by `ticket_board.py` to label claimable

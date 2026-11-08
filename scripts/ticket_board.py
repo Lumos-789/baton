@@ -278,8 +278,6 @@ def set_task_checked(
     return {"task": task_id, "action": "unchecked", "reverse": reverse}
 
 
-# ── CLI ────────────────────────────────────────────────────
-
 def _print(data: dict) -> None:
     print(json.dumps(data, ensure_ascii=False, indent=2))
 

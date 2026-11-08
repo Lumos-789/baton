@@ -165,7 +165,12 @@ python3 scripts/ticket_board.py build-all /path/to/project
 # -> .dsh/baton/board-all.html   （所有变更一板）
 python3 scripts/ticket_board.py build /path/to/project <change-id>
 # -> .dsh/baton/<change-id>/board.html
+# 项目恰有一个变更时，build/scan 可省略 <change-id>——最常见的 day-one
+# 情形；零个或多个变更时省略会 fail loud（点名所搜目录或列出候选）。
 ```
+
+点击卡片会显示可复制的 `check` / `uncheck` 命令（任意目录可执行）；一次
+翻转就会就地改写所有已构建的看板——刷新页面即可。
 
 ## 包内容
 

@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.1 (2026-11-09)
+
+Unfreeze simplify round — documentation parity and comment cleanup only,
+zero behavior change.
+
+- `docs/architecture.md`: the Module Dependencies graph now carries the
+  `session_controller.py → relay.py` edge (introduced with the relay in
+  0.4.0) and a `relay.py` entry joins the explanation list, matching the
+  AGENTS.md module table.
+- `README_CN.md`: the observability section documents the two behaviors
+  README.md already had — omitting `<change-id>` for `build`/`scan` when the
+  project has exactly one change (the omission fails loud on zero or
+  several), and the card-click `check`/`uncheck` commands that rewrite built
+  boards in place.
+- Dropped the two decorative divider comment blocks (`scripts/ticket_board.py`,
+  `scripts/orchestration/model.py`); no code path touched.
+
 ## 0.4.0 (2026-11-06)
 
 Relay-safety round: an in-flight attempt can no longer be silently destroyed
