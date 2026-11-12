@@ -11,6 +11,10 @@ Mapping rules (authoritative source: docs/ticket-format.md):
 - ``## N. Section title`` starts section N.
 - ``- [ ] N.M text`` / ``- [x] N.M text`` is task N.M (bullet ``-``/``*``/``+``,
   checkbox ``[ ]``/``[x]``/``[X]`` all tolerated).
+- A checkbox with a task id but no text (``- [ ] 1.2``) is a validation error
+  naming the line — never a silently dropped ticket.
+- Lines inside a fenced code block (````` ``` `````) are not tasks; example
+  checkboxes in docs stay examples.
 - Ticket num = ``N * 100 + M`` (1.2 → 102, 3.4 → 304); reversible for display.
 - Status: unchecked → ``ready``; checked → ``resolved``. No draft state —
   an unapproved change simply is not run.
@@ -25,7 +29,9 @@ Mapping rules (authoritative source: docs/ticket-format.md):
 
 from __future__ import annotations
 
+import os
 import re
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -33,6 +39,8 @@ VALID_STATUSES = {"ready", "resolved"}
 
 _SECTION_RE = re.compile(r"^##\s+(\d+)\s*[.\u3002]?\s*(.*?)\s*$")
 _TASK_RE = re.compile(r"^[-*+]\s*\[\s*([ xX])\s*\]\s+(\d+)\.(\d+)\s+(.+?)\s*$")
+_TASK_NO_TEXT_RE = re.compile(r"^[-*+]\s*\[\s*[ xX]\s*\]\s+\d+\.\d+\s*$")
+_FENCE_RE = re.compile(r"^\s*```")
 _CHANGE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
@@ -102,7 +110,7 @@ def parse_tasks_md(path: str | Path) -> list[Ticket]:
 
     Raises:
         TasksMarkdownError: file missing, no sections/tasks, duplicate or
-            misfiled task ids.
+            misfiled task ids, a task id with no description text.
     """
     path = Path(path)
     if not path.is_file():
@@ -117,8 +125,14 @@ def parse_tasks_md(path: str | Path) -> list[Ticket]:
     parsed: list[tuple[int, int, bool, str]] = []  # (section, item, done, text)
     seen_nums: set[int] = set()
     current_section: int | None = None
+    in_fence = False
 
-    for raw in text.splitlines():
+    for lineno, raw in enumerate(text.splitlines(), start=1):
+        if _FENCE_RE.match(raw):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
         section_match = _SECTION_RE.match(raw)
         if section_match:
             current_section = int(section_match.group(1))
@@ -126,8 +140,15 @@ def parse_tasks_md(path: str | Path) -> list[Ticket]:
                 section_order.append(current_section)
                 section_titles[current_section] = section_match.group(2)
             continue
+        if current_section is None:
+            continue
+        if _TASK_NO_TEXT_RE.match(raw):
+            raise TasksMarkdownError(
+                f"task on line {lineno} of {path} has no description text: "
+                f"{raw.strip()!r}"
+            )
         task_match = _TASK_RE.match(raw)
-        if task_match and current_section is not None:
+        if task_match:
             done = task_match.group(1).lower() == "x"
             sec, item = int(task_match.group(2)), int(task_match.group(3))
             if sec != current_section:
@@ -203,7 +224,7 @@ def check_task(path: str | Path, num: int) -> None:
         ):
             return  # already checked — idempotent
         raise TasksMarkdownError(f"task {task_id} not found in {path}")
-    tmp = path.with_suffix(".md.tmp")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     with open(tmp, "w", encoding="utf-8", newline="") as handle:
         handle.write(new_text)
     tmp.replace(path)
@@ -236,7 +257,7 @@ def uncheck_task(path: str | Path, num: int) -> None:
     new_text, count = pattern.subn(r"\g<1> \g<2>", text)
     if count == 0:
         raise TasksMarkdownError(f"task {task_id} is not checked in {path}")
-    tmp = path.with_suffix(".md.tmp")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     with open(tmp, "w", encoding="utf-8", newline="") as handle:
         handle.write(new_text)
     tmp.replace(path)

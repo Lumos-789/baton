@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.4.2 (2026-11-12)
+
+Integration-trust round: what lands on the integration branch is exactly the
+commit the sealed receipt verified, and the ticket parser stops guessing.
+Every item below was reproduced against a real git repo before it was fixed,
+and each fix carries a regression test.
+
+- **A branch that advanced past the seal is refused, not silently merged.**
+  `reconcile` used to merge the assignment *branch*, so a commit added after
+  sealing (subagent kept working, stray process) was integrated even though it
+  never ran the verification commands. `integrate_assignment` now takes the
+  receipt's `expected_sha`: a moved tip is a named block
+  (`blocked: branch-moved-after-seal`, attempt parked in `blocked-review`)
+  naming the actual tip and the expected sha, with both exits documented
+  (re-seal at the new tip — `seal` re-runs verification there — or `abandon`).
+  Nothing is merged unless the branch tip is the verified commit or that
+  commit already landed (a resolved conflict); the moved tip's extra commits
+  simply stay unmerged.
+- **A preserved conflict stays owned by its assignment when the branch moves.**
+  Conflict ownership was judged by `MERGE_HEAD` vs the *current* branch tip;
+  one post-conflict commit turned the owner into a bystander and the attempt
+  silently sat in `blocked-review` forever (only wait actions, and lease
+  expiry does not cover `blocked-review`). Ownership now compares `MERGE_HEAD`
+  to the receipt's verified commit — the same sha the merge gate uses — so
+  `resolve_merge` keeps being produced and the run progresses after the
+  resolution.
+- **A checkbox with a task id but no text is a validation error.** `- [ ] 1.2`
+  failed the parser's non-empty-text group and vanished: the ticket was never
+  dispatched and nothing reported it. It now raises `TasksMarkdownError`
+  naming the line, like duplicate/misfiled ids (`docs/ticket-format.md`
+  updated).
+- **Fenced code blocks are documentation, not tickets.** Example checkboxes
+  inside ``` fences are skipped: a misfiled id in a quoted sample no longer
+  explodes the whole parse, and a matching id no longer becomes a ghost
+  ticket.
+- **Concurrent CLI processes no longer share one temp file name.** `plan.json`
+  and `tasks.md` writes used fixed `<name>.tmp` siblings; interleaved writes
+  could truncate each other's payload before the rename. Temp names now carry
+  pid + uuid (per-assignment packet/receipt files were left as-is: single
+  writer by construction).
+
+Regression: 196 → 211 tests pass; `./tests/regression.sh` 5/5 stages green.
+
 ## 0.4.1 (2026-11-09)
 
 Unfreeze simplify round — documentation parity and comment cleanup only,

@@ -134,8 +134,16 @@ def _not_merged(reason: str, files: list[str]) -> dict[str, Any]:
 def integrate_assignment(
     integration_path: str | Path,
     assignment_branch: str,
+    *,
+    expected_sha: str = "",
 ) -> dict[str, Any]:
     """Merge ``assignment_branch`` into the shared integration worktree.
+
+    ``expected_sha`` is the commit the sealed receipt verified. When given, the
+    merge only ever touches that commit: a branch tip that moved past it is
+    refused (``branch-moved``) unless the verified commit already landed, and a
+    preserved merge is attributed by ``MERGE_HEAD`` — not by the (possibly
+    advanced) branch tip.
 
     Returns ``ok=True`` with the new ``integration_sha``, or ``ok=False`` with
     a ``reason`` the controller must distinguish:
@@ -148,28 +156,55 @@ def integrate_assignment(
       path list belongs to the earlier merge — reporting it as this branch's
       conflict would mis-attribute the failure and hand two solvers the same
       worktree.)
+    - ``branch-moved``: the branch advanced past ``expected_sha`` and that
+      commit is not in ``HEAD`` either. Nothing was attempted; integrating the
+      branch would merge commits that never ran the verification commands.
     - ``worktree-dirty``: tracked files in the shared worktree have
       uncommitted changes, so a merge could destroy them. Nothing was
       attempted.
     """
     path = Path(integration_path).resolve()
     with _integration_lock(path):
-        return _integrate_locked(path, assignment_branch)
+        return _integrate_locked(path, assignment_branch, expected_sha)
 
 
-def _integrate_locked(path: Path, assignment_branch: str) -> dict[str, Any]:
+def _integrate_locked(
+    path: Path, assignment_branch: str, expected_sha: str
+) -> dict[str, Any]:
     merge_head = _merge_head(path)
     if merge_head:
-        # A preserved conflict blocks every other merge. ``MERGE_HEAD`` is the
-        # tip of the branch being merged, which tells us whether the pending
-        # merge belongs to this assignment or to a different one.
-        if merge_head == _branch_tip(path, assignment_branch):
+        # A preserved conflict blocks every other merge. Ownership is judged by
+        # ``MERGE_HEAD`` against the receipt's verified commit when known: the
+        # branch tip may legitimately advance after the merge was preserved,
+        # and that must not turn the owning assignment into a bystander.
+        owner_sha = expected_sha or _branch_tip(path, assignment_branch)
+        if merge_head == owner_sha:
             return _not_merged("conflict", _conflict_files(path))
         return _not_merged("merge-in-progress", _conflict_files(path))
 
     dirty = _dirty_files(path)
     if dirty:
         return _not_merged("worktree-dirty", dirty)
+
+    tip = _branch_tip(path, assignment_branch)
+    if expected_sha and tip and tip != expected_sha:
+        if branch_is_merged(path, expected_sha, "HEAD"):
+            head = _git(path, ["rev-parse", "HEAD"])
+            return {
+                "ok": True,
+                "already_merged": True,
+                "integration_sha": head.stdout.strip(),
+                "conflicts": [],
+            }
+        return {
+            "ok": False,
+            "reason": "branch-moved",
+            "already_merged": False,
+            "integration_sha": "",
+            "conflicts": [],
+            "branch_tip": tip,
+            "expected_sha": expected_sha,
+        }
 
     if branch_is_merged(path, assignment_branch, "HEAD"):
         head = _git(path, ["rev-parse", "HEAD"])

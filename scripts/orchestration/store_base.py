@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -43,10 +44,12 @@ def _atomic_write(path: Path, text: str) -> None:
     recovery path. We write to a sibling temp file then ``os.replace`` (POSIX
     atomic rename) so ``path`` is either the old content or the complete new
     content, never a partial write. ``fsync`` before rename persists the bytes
-    so a crash after rename still has the file on disk.
+    so a crash after rename still has the file on disk. The temp name carries
+    the pid and a uuid: concurrent CLI processes share ``path``, and a fixed
+    temp name let their interleaved writes corrupt each other's payload.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.{uuid.uuid4().hex}.tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(text)
         f.flush()

@@ -663,7 +663,9 @@ class SessionController:
             ) from exc
         try:
             result = integrate_assignment(
-                attempt.integration_path, attempt.worktree_branch
+                attempt.integration_path,
+                attempt.worktree_branch,
+                expected_sha=envelope.commit_sha,
             )
         except WorktreeError as exc:
             return self._integration_failed(attempt, claim_token, str(exc))
@@ -689,6 +691,8 @@ class SessionController:
                 failure_code="merge-conflict",
             )
             return self._merge_action(attempt, claim_token, result.get("conflicts", []))
+        if reason == "branch-moved":
+            return self._branch_moved_action(attempt, claim_token, result)
         if reason == "merge-in-progress":
             # The shared worktree is mid-merge for a *different* assignment.
             # Leave this attempt untouched: it is retried on the next call,
@@ -733,6 +737,43 @@ class SessionController:
                 f"{attempt.integration_path}: {detail}. Nothing was merged. Fix the "
                 f"integration worktree, or retire the attempt with "
                 f"`abandon {attempt.assignment_id}`."
+            ),
+        )
+
+    def _branch_moved_action(
+        self,
+        attempt: ExecutionAttempt,
+        claim_token: str,
+        result: dict[str, Any],
+    ) -> BlockedAction:
+        """Refuse to integrate a branch that advanced past the verified commit.
+
+        The sealed receipt verified ``expected_sha``; commits added to the
+        branch after the seal never ran the verification commands, so merging
+        the branch would integrate unverified work. Nothing was merged.
+        """
+        tip = str(result.get("branch_tip", "")) or "<unreadable>"
+        expected = str(result.get("expected_sha", "")) or "<unknown>"
+        try:
+            self.store.mark_execution_attempt_state(
+                attempt.assignment_id,
+                claim_token,
+                "blocked-review",
+                failure_code="branch-moved-after-seal",
+            )
+        except ExecutionAttemptError:
+            pass
+        return BlockedAction(
+            code="branch-moved-after-seal",
+            ticket_num=attempt.ticket_num,
+            reason=(
+                f"branch {attempt.worktree_branch} tip is {tip} but the sealed "
+                f"receipt for {attempt.assignment_id} verified {expected}; "
+                "commits after the seal were never verified. Nothing was "
+                "merged. Re-seal from the new tip (receipt.py seal re-runs the "
+                "verification commands there) and call actions again, or "
+                f"retire the attempt with `abandon {attempt.assignment_id}` "
+                "(the ticket is re-claimed fresh)."
             ),
         )
 

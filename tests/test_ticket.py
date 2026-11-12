@@ -246,7 +246,7 @@ def test_uncheck_task_preserves_crlf_line_endings(tmp_path):
 def test_uncheck_task_leaves_no_temp_file_behind(tmp_path):
     path = _write(tmp_path, SAMPLE)
     uncheck_task(path, 101)
-    assert not path.with_suffix(".md.tmp").exists()
+    assert not list(path.parent.glob("*.tmp"))
 
 
 @pytest.mark.parametrize("checkbox", ["- [x] ", "* [X] ", "+ [ x ] ", "-\t[x] "])
@@ -261,3 +261,103 @@ def test_uncheck_task_matches_the_checkbox_forms_the_parser_accepts(
     # check_task can flip it forward again: the two are exact mirrors.
     check_task(path, 101)
     assert [t.status for t in parse_tasks_md(path)] == ["resolved"]
+
+
+# --- checkbox without task text (fail-loud, never a dropped ticket) ----------
+
+
+@pytest.mark.parametrize("line", ["- [ ] 1.2", "* [x] 1.2  ", "+ [ ] 1.2\t"])
+def test_checkbox_without_task_text_raises_naming_the_line(tmp_path, line):
+    # `- [ ] 1.2` used to fail _TASK_RE's non-empty-text group and vanish:
+    # the ticket was never dispatched and nothing ever reported it.
+    body = f"# Tasks: demo\n\n## 1. Seed\n\n- [ ] 1.1 real task\n{line}\n"
+    with pytest.raises(TasksMarkdownError, match="line 6 .*no description text"):
+        parse_tasks_md(_write(tmp_path, body))
+
+
+def test_textless_checkbox_outside_any_section_is_ignored(tmp_path):
+    # Same tolerance as stray task lines: before the first `## N.` header a
+    # checkbox is not a task line at all.
+    body = "- [ ] 9.9\n\n## 1. A\n\n- [ ] 1.1 real\n"
+    assert [t.task_id for t in parse_tasks_md(_write(tmp_path, body))] == ["1.1"]
+
+
+# --- fenced code blocks are documentation, not tickets -----------------------
+
+
+def test_fenced_example_checkboxes_are_not_tickets(tmp_path):
+    body = (
+        "# Tasks: demo\n\n"
+        "## 1. Seed\n\n"
+        "- [ ] 1.1 real task\n\n"
+        "Example from the format doc:\n\n"
+        "```\n"
+        "- [ ] 1.2 ghost task that matches this section\n"
+        "- [ ] 9.9 misfiled id that would explode\n"
+        "- [ ] 1.1 duplicate id that would explode\n"
+        "## 4. Ghost section\n"
+        "```\n\n"
+        "## 2. Build\n\n"
+        "- [ ] 2.1 real build\n"
+    )
+    tickets = parse_tasks_md(_write(tmp_path, body))
+    assert [t.task_id for t in tickets] == ["1.1", "2.1"]
+
+
+def test_indented_fence_lines_are_skipped_too(tmp_path):
+    body = (
+        "## 1. A\n\n- [ ] 1.1 real\n\n"
+        "   ```markdown\n"
+        "   - [ ] 1.2 indented ghost\n"
+        "   ```\n"
+    )
+    assert [t.task_id for t in parse_tasks_md(_write(tmp_path, body))] == ["1.1"]
+
+
+# --- unique temp names: concurrent CLI processes share these files -----------
+
+
+def test_check_task_tmp_names_are_unique_per_write(tmp_path, monkeypatch):
+    # A fixed `tasks.md.tmp` let two concurrent flips truncate each other's
+    # payload mid-write; each writer now renames its own pid+uuid temp file.
+    path = _write(tmp_path, SAMPLE)
+    seen: list[str] = []
+    original_replace = Path.replace
+
+    def spy(self: Path, target):
+        seen.append(self.name)
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", spy)
+
+    check_task(path, 201)
+    check_task(path, 203)
+
+    assert len(seen) == 2
+    assert len(set(seen)) == 2
+    assert all(name.startswith("tasks.md.") and name.endswith(".tmp") for name in seen)
+
+
+def test_concurrent_flips_never_leave_a_torn_tasks_md(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    nums = [101, 102, 201, 202, 203, 301]
+    body = (
+        "# Tasks: demo\n\n## 1. A\n\n- [ ] 1.1 a\n- [ ] 1.2 b\n\n"
+        "## 2. B\n\n- [ ] 2.1 c\n- [ ] 2.2 d\n- [ ] 2.3 e\n\n"
+        "## 3. C\n\n- [ ] 3.1 f\n"
+    )
+    path = _write(tmp_path, body)
+
+    def churn(num: int) -> None:
+        for _ in range(20):
+            check_task(path, num)
+
+    with ThreadPoolExecutor(max_workers=len(nums)) as pool:
+        list(pool.map(churn, nums))
+
+    # Every intermediate rename installed a complete file: the result always
+    # re-parses, and no temp sibling survives.
+    tickets = parse_tasks_md(path)
+    assert len(tickets) == len(nums)
+    assert not list(path.parent.glob("*.tmp"))

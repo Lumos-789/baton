@@ -291,6 +291,11 @@ and must not be used to judge completion.
   example unrelated histories). Nothing was merged and the attempt is parked in
   `blocked-review` instead of sitting in `integrating` until its lease expires.
   Fix the integration worktree, then `actions` again, or `abandon`.
+- **`blocked: branch-moved-after-seal`** → the assignment branch advanced past
+  the commit the sealed receipt verified, so merging it would integrate work
+  that never ran the verification commands. Nothing was merged. Re-seal from
+  the new tip (`receipt.py seal` re-runs the verification commands there) and
+  `actions` again, or `abandon` the attempt (the ticket is re-claimed fresh).
 - **`HEAD did not advance from the assignment baseline`** → the subagent
   committed nothing. If the ticket genuinely changes no files (a verification
   or decision-only task), have it record that with an explicit empty commit

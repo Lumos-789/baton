@@ -204,3 +204,118 @@ def test_lock_left_by_dead_process_is_recovered(tmp_path):
 
     assert result["ok"]
     assert not lock.exists()
+
+
+# --- the branch advanced past the sealed commit ------------------------------
+
+
+def _tip(path: Path, ref: str = "HEAD") -> str:
+    return subprocess.run(
+        ["git", "-C", str(path), "rev-parse", ref],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+def test_branch_moved_past_the_sealed_commit_is_refused(tmp_path):
+    """Only the commit the receipt verified may be integrated — not the tip.
+
+    A subagent (or a stray process) can commit to the assignment branch after
+    sealing; those commits never ran the verification commands, so merging the
+    branch would integrate unverified work.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    _init(project)
+    integration = prepare_integration_worktree(project, "feat")
+    assignment = prepare_assignment_worktree(project, "feat", 1, 1)
+    (assignment.path / "ticket.txt").write_text("done\n")
+    _run(assignment.path, ["add", "-A"])
+    _run(assignment.path, ["commit", "-m", "verified work"])
+    sealed = _tip(assignment.path)
+
+    (assignment.path / "UNVERIFIED.txt").write_text("after seal\n")
+    _run(assignment.path, ["add", "-A"])
+    _run(assignment.path, ["commit", "-m", "post-seal commit"])
+    moved = _tip(assignment.path)
+
+    before = _tip(integration.path)
+    result = integrate_assignment(integration.path, assignment.branch, expected_sha=sealed)
+
+    assert not result["ok"]
+    assert result["reason"] == "branch-moved"
+    assert result["branch_tip"] == moved
+    assert result["expected_sha"] == sealed
+    assert _tip(integration.path) == before
+    assert not (integration.path / "ticket.txt").exists()
+    assert not (integration.path / "UNVERIFIED.txt").exists()
+
+
+def test_moved_branch_with_sealed_commit_already_landed_is_already_merged(tmp_path):
+    """After a resolved conflict, the sealed commit may already be in HEAD.
+
+    The branch tip moving later must not block finalizing the attempt: the
+    verified commit is integrated, the extra commits simply stay unmerged.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    _init(project)
+    integration = prepare_integration_worktree(project, "feat")
+    assignment = prepare_assignment_worktree(project, "feat", 1, 1)
+    (assignment.path / "base.txt").write_text("assignment\n")
+    _run(assignment.path, ["add", "-A"])
+    _run(assignment.path, ["commit", "-m", "verified work"])
+    sealed = _tip(assignment.path)
+
+    # The verified commit lands (here: directly, e.g. via a resolved merge).
+    _run(integration.path, ["merge", "--no-ff", "--no-edit", assignment.branch])
+    landed = _tip(integration.path)
+
+    (assignment.path / "extra.txt").write_text("post-seal commit\n")
+    _run(assignment.path, ["add", "-A"])
+    _run(assignment.path, ["commit", "-m", "post-seal commit"])
+
+    result = integrate_assignment(integration.path, assignment.branch, expected_sha=sealed)
+
+    assert result["ok"]
+    assert result["already_merged"]
+    assert result["integration_sha"] == landed
+    assert not (integration.path / "extra.txt").exists()
+
+
+def test_preserved_conflict_ownership_survives_branch_advance(tmp_path):
+    """MERGE_HEAD, not the branch tip, decides who owns a preserved merge.
+
+    The assignment branch may legitimately advance after its conflict was
+    preserved; comparing MERGE_HEAD to the (moved) tip re-attributed the merge
+    to nobody — the owning assignment silently lost its resolve_merge action
+    forever.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    _init(project)
+    integration = prepare_integration_worktree(project, "feat")
+    assignment = prepare_assignment_worktree(project, "feat", 1, 1)
+    other = prepare_assignment_worktree(project, "feat", 2, 1)
+
+    (integration.path / "base.txt").write_text("integration\n")
+    _run(integration.path, ["add", "-A"])
+    _run(integration.path, ["commit", "-m", "integration change"])
+    (assignment.path / "base.txt").write_text("assignment\n")
+    _run(assignment.path, ["add", "-A"])
+    _run(assignment.path, ["commit", "-m", "conflicting assignment work"])
+    sealed = _tip(assignment.path)
+
+    conflict = integrate_assignment(integration.path, assignment.branch)
+    assert conflict["reason"] == "conflict"
+
+    (assignment.path / "extra.txt").write_text("branch advances\n")
+    _run(assignment.path, ["add", "-A"])
+    _run(assignment.path, ["commit", "-m", "post-conflict commit"])
+
+    owned = integrate_assignment(
+        integration.path, assignment.branch, expected_sha=sealed
+    )
+    assert owned["reason"] == "conflict"
+
+    bystander = integrate_assignment(integration.path, other.branch)
+    assert bystander["reason"] == "merge-in-progress"

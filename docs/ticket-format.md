@@ -41,6 +41,11 @@ feature; a task is a ticket.
   checkbox states `[ ]`/`[x]`/`[X]` are all tolerated.
 - A task line only counts inside a section; stray checkboxes before the
   first `## N.` header are ignored.
+- Lines inside a fenced code block (``` fences) are never tasks: example
+  checkboxes quoted from this document stay examples (no ghost tickets, no
+  phantom misfiled/duplicate ids).
+- A checkbox with a task id but no description text (``- [ ] 1.2``) is a
+  validation error, not a silently dropped ticket.
 
 ### Mapping
 
@@ -72,6 +77,8 @@ file order is the safe dependency order. Consequences:
 - no `## N.` sections / no task lines
 - duplicate task id (e.g. two `2.1`)
 - task id filed under the wrong section (e.g. `1.2` under `## 2.`)
+- checkbox with a task id but no description text (e.g. `- [ ] 1.2`) → error
+  naming the line number
 
 ### Write-back
 

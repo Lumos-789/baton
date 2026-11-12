@@ -120,3 +120,36 @@ def test_capacity_above_five_is_rejected(tmp_path):
 def test_plan_store_rejects_feature_path_traversal(tmp_path, feature):
     with pytest.raises(PlanStoreError, match="change id"):
         PlanStore(_project(tmp_path), feature)
+
+
+def test_atomic_write_temp_names_are_unique_per_write(tmp_path, monkeypatch):
+    """plan.json is shared by every concurrent CLI process.
+
+    A fixed `plan.json.tmp` let two writers truncate each other's payload
+    mid-write (one rename then installed mixed bytes); each writer now renames
+    its own pid+uuid temp file.
+    """
+    import os
+
+    from orchestration import store_base
+
+    path = tmp_path / "plan.json"
+    seen: list[str] = []
+    real_replace = os.replace
+
+    def spy(src, dst):
+        seen.append(Path(src).name)
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(store_base.os, "replace", spy)
+
+    store_base._atomic_write(path, '{"a": 1}\n')
+    store_base._atomic_write(path, '{"a": 2}\n')
+
+    assert len(seen) == 2
+    assert len(set(seen)) == 2
+    assert all(
+        name.startswith("plan.json.") and name.endswith(".tmp") for name in seen
+    )
+    assert path.read_text(encoding="utf-8") == '{"a": 2}\n'
+    assert not list(tmp_path.glob("*.tmp"))
