@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.3 (2026-11-18)
+
+- New icon: 1-bit monochrome pixel relay — two gloves passing a glowing baton
+  across a dashed node path. Part of the shared pixel family across the six
+  plugins; no code changes.
+
 ## 0.4.2 (2026-11-12)
 
 Integration-trust round: what lands on the integration branch is exactly the
