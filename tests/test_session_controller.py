@@ -1005,3 +1005,74 @@ def test_conflicted_attempt_keeps_resolve_merge_after_branch_advance(tmp_path):
     assert action.ticket_num not in controller.store.latest_completion()[
         "missingRequiredTickets"
     ]
+
+
+# --- blocked-review without a re-readable receipt dispatches by failure code
+
+
+def _drop_receipt_and_packet(action) -> None:
+    payload = _packet_payload(action)
+    Path(payload["receiptPath"]).unlink()
+    Path(action.packet_path).unlink()
+
+
+def test_branch_moved_blocked_review_without_receipt_is_blocked_not_resolve_merge(
+    tmp_path,
+):
+    """A branch-moved attempt whose receipt vanished from disk must not be
+    handed a resolve_merge prompt: nothing was merged, so there is no
+    preserved merge to resolve."""
+    project = _project(tmp_path)
+    controller = _controller(project)
+    action = _dispatches(controller.actions("session-a", capacity=1))[0]
+    _finish(action, "task-2.1.txt")
+    _advance_branch(action, "UNVERIFIED.txt")
+
+    blocked = controller.reconcile(
+        action.assignment_id,
+        action.claim_token,
+        agent_terminal="completed",
+        session_id="session-a",
+    )
+    assert [item.code for item in blocked.actions if item.kind == "blocked"] == [
+        "branch-moved-after-seal"
+    ]
+
+    _drop_receipt_and_packet(action)
+    again = controller.actions("session-a", capacity=1)
+
+    assert not any(item.kind == "resolve_merge" for item in again.actions)
+    assert [item.code for item in again.actions if item.kind == "blocked"] == [
+        "branch-moved-after-seal"
+    ]
+
+
+def test_integration_failed_blocked_review_without_receipt_is_blocked_not_resolve_merge(
+    tmp_path, monkeypatch
+):
+    """Same rule for integration-failed: the failure merged nothing, so the
+    re-dispatch is the named blocked action, never a resolve_merge."""
+    import orchestration.session_controller as session_controller
+
+    project = _project(tmp_path)
+    controller = _controller(project)
+    action = _dispatches(controller.actions("session-a", capacity=1))[0]
+    (Path(action.cwd) / "ticket.txt").write_text("done\n", encoding="utf-8")
+    _seal_all([action])
+
+    def boom(*args, **kwargs):
+        raise WorktreeError("fatal: refusing to merge unrelated histories")
+
+    monkeypatch.setattr(session_controller, "integrate_assignment", boom)
+    batch = controller.actions("session-a", capacity=1)
+    assert [item.code for item in batch.actions if item.kind == "blocked"] == [
+        "integration-failed"
+    ]
+
+    _drop_receipt_and_packet(action)
+    again = controller.actions("session-a", capacity=1)
+
+    assert not any(item.kind == "resolve_merge" for item in again.actions)
+    assert [item.code for item in again.actions if item.kind == "blocked"] == [
+        "integration-failed"
+    ]

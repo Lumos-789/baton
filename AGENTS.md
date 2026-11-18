@@ -34,6 +34,7 @@ cognitive state machine on the active path.
 | `scripts/orchestration/plan_model.py` | shared plan data model: `PlanTicket` / `PlanRevision` + `utc_now`/`stable_hash` |
 | `scripts/orchestration/integrator.py` | serial git integration of assignment branches; preserves merge conflicts for `resolve_merge` |
 | `scripts/orchestration/worktree.py` | isolated assignment + integration worktrees (one branch per assignment) |
+| `scripts/orchestration/git_run.py` | the single git subprocess wrapper (`run_git` with caller-chosen error type) shared by controller/integrator/worktree/receipt |
 | `scripts/orchestration/receipt.py` / `result.py` | sealed-receipt verify/seal core + `ResultEnvelope` (success evidence model) |
 | `scripts/orchestration/session_model.py` | action batch models (dispatch/recover/resolve_merge/wait/blocked/complete) + Task Packet finalization |
 | `scripts/receipt.py` | subagent-facing `verify`/`seal` CLI — the only accepted success evidence |
