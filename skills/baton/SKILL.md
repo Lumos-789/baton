@@ -16,9 +16,21 @@ counts as success.
 
 ## Invocation
 
-`<baton-root>` is the directory containing this bundle's `package.json` (two
+`<baton-root>` is the directory containing this plugin's `package.json` (two
 levels above this `SKILL.md`). Relative doc paths below are written against that
 root, not the skill directory.
+
+## Host tools
+
+Baton runs on any host that can spawn subagents. The loop below is written with
+the DSH tool names; on ZCode substitute per this table.
+
+| Need | DSH | ZCode |
+|---|---|---|
+| Spawn a child | `subagent(prompt, cwd, description)` | `Agent(description, prompt)` — omitting `subagent_type` gives the general-purpose agent; there is no `cwd` argument, and the dispatch prompt names the worktree to work in |
+| Agent id for `bind` | the id returned by `subagent` | the `agent_<uuid>` returned by `Agent` |
+| Completion notice | DSH settlement notice (prose) | the background task notification for that agent id |
+| Inspect or steer a running child (optional) | `list_agents` / `send_message` | `SendMessage` |
 
 `<python>` is a Python 3.10+ interpreter: `python3` on macOS/Linux, `python` on
 Windows.
@@ -52,10 +64,10 @@ required task of the change is verified and integrated.
 
 ### Prerequisites
 
-- The `dsh-openspec-baton` bundle is installed (this skill is mounted, and
+- Baton is installed (this skill is mounted, and
   `<baton-root>/scripts/session_control.py` exists).
-- The active DSH profile provides `subagent`. `list_agents` / `send_message` are
-  only needed to inspect or steer a running child.
+- The host provides a subagent tool — `subagent` on DSH, `Agent` on ZCode (see
+  "Host tools"). The inspect / steer tools are only needed for a running child.
 - The target project is a **git repository** with an OpenSpec change at
   `<project path>/openspec/changes/<change-id>/` containing `proposal.md` and a
   `tasks.md` with at least one unchecked `- [ ] N.M` task whose section
@@ -90,8 +102,9 @@ required task of the change is verified and integrated.
    - `complete` → every required ticket has a verified, integrated receipt. Run
      `status` for the final summary and stop.
 
-3. **On each subagent completion notice**, `reconcile`. DSH settlement notices
-   are prose, not a status enum — map them explicitly: "finished" → `completed`;
+3. **On each child's completion notice**, `reconcile`. DSH settlement notices
+   are prose, not a status enum — map them explicitly (ZCode's task notification
+   maps the same way): "finished" → `completed`;
    stopped / canceled / interrupted → `canceled`; failed / "ran out of room" /
    declined / abnormal → `failed`.
 
@@ -314,7 +327,8 @@ and must not be used to judge completion.
 
 ## Installation
 
-Baton ships as the `dsh-openspec-baton` DSH bundle; installing it mounts
-`skills/` so this skill is available. No background process and no manual tool
-registration are required — the skill drives
+Baton ships as the `dsh-openspec-baton` DSH bundle and as the `baton` ZCode
+plugin; either install mounts `skills/` so this skill is available. No
+background process and no manual tool registration are required — the skill
+drives
 `<baton-root>/scripts/session_control.py` directly.

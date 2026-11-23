@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.5 (2026-11-23)
+
+Docs-only host-portability round from the 11-23 review; no code change.
+
+- **SKILL.md now maps host tools for ZCode.** The loop was written with DSH tool
+  names only (`subagent(...)` with a `cwd` argument, "the active DSH profile
+  provides `subagent`"), so the ZCode plugin form shipped a skill that described
+  another host. A "Host tools" table maps DSH ↔ ZCode (spawn, the agent id for
+  `bind`, the completion notice, optional steer), and the prerequisites and the
+  installation section name both forms. ZCode's `Agent` has no `cwd` argument;
+  the dispatch prompt already names the worktree, so runtime is unchanged.
+
 ## 0.4.4 (2026-11-18)
 
 Dead-code and dispatch-semantics round from the 11-18 audit: eight items, no
