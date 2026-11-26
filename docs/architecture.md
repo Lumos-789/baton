@@ -32,46 +32,92 @@ context window").
 |---|---|---|---|
 | 1 | **Dependency** | tasks have a section-order DAG; what runs next must respect it | `SessionController.actions()` computes the frontier fresh on every call and atomically claims distinct unchecked tasks |
 | 2 | **Concurrency** | ≤5 parallel tasks must not collide on a shared workspace | one isolated git worktree per assignment; serial integration under a repository-scoped lock |
-| 3 | **State** | a subagent finishing is not the same as a task being done | a **sealed receipt** (verification commands run green in the worktree) is the only accepted success evidence; the controller integrates the branch, finalizes the attempt, and flips the task's `[x]` in tasks.md |
+| 3 | **State** | a subagent finishing is not the same as a task being done | a **sealed receipt** (verification commands run green in the worktree) is the only accepted success evidence; the controller integrates the branch, **re-runs the verification commands on the merged tree**, finalizes the attempt, and flips the task's `[x]` in tasks.md |
 
 ### Why the sealed receipt solves the state problem
 
 A subagent's terminal lifecycle event (`completed`/`failed`/`canceled`) is **not**
 success. `reconcile` only honors a sealed receipt written by
-`scripts/receipt.py verify`/`seal` — which re-runs the packet's declared
-verification commands on a clean, advanced HEAD in the assignment worktree. A
-terminal event without a sealed receipt flips the attempt to `unknown` and
-returns a `recover` action. It is never silently marked successful.
+`scripts/receipt.py seal` — which runs the packet's declared verification
+commands on a clean, advanced HEAD in the assignment worktree. A terminal event
+without a sealed receipt flips the attempt to `unknown` and returns a `recover`
+action. It is never silently marked successful.
 
 A sealed receipt is hash-bound local evidence (packet hash, claim-token hash,
 clean advanced HEAD, exit-0 verification results). `seal` digests the whole
 envelope body — canonical JSON (sorted keys, no whitespace, `receiptHash`
 excluded) — into `receiptHash`, and `reconcile` recomputes it from the file
 *before* merging: an edited `exitCode`, `changed_files`, `commit_sha`, or any
-other field is rejected with a non-zero exit and the changed segment named. The
-receipt's ticket/assignment/revision are also checked against the attempt
-before integration, so a receipt for another ticket can never leave an attempt
-stuck in `integrating`. It bounds state transitions; it is not a cryptographic
-guarantee against a subagent that edits files directly (the digest has no
-secret).
+other field is rejected with the changed segment named, and surfaces as a
+`recover` (reason `receipt-invalid`) that does not derail the rest of the
+batch. The receipt's ticket/assignment/revision are also checked against the
+attempt before integration, so a receipt for another ticket can never leave an
+attempt stuck in `integrating`. It bounds state transitions; it is not a
+cryptographic guarantee against a subagent that edits files directly (the
+digest has no secret).
 
-### Why leases are fixed at 7200 s
+### Why the merged tree is verified too
+
+A receipt proves one branch is green *on its own*. With capacity above one,
+two independently green branches can break each other once merged (an API
+renamed on one, a new caller of the old name on the other), and a conflict
+resolution is verified by nobody. Before 0.5.0 the controller trusted the
+per-branch receipts and could report `complete` on a red integration branch.
+
+So every merge is followed by the controller's own verification run on the
+integration worktree — inside the integration lock, so nothing else merges
+onto an unverified tip. A red result parks the attempt in `blocked-review`
+(`post-merge-verification-failed`) and returns a `repair_integration` action;
+the merge commit is kept (nothing is reset) and the outcome is recorded per
+integration HEAD, so other receipts wait, no new ticket branches from the red
+base, and a later call re-reads the recorded result instead of re-running the
+suite. Once a fix is committed, the next reconcile re-verifies and finalizes.
+This also moves the trust boundary: what lands on the integration branch is
+what the *controller* saw pass, not what a subagent reported.
+
+A verification that cannot run at all (a timeout, a command that cannot
+start) parks the attempt the same way, with the error in the repair prompt —
+the merge did land, so it is never reported as "nothing was merged". The
+recorded outcome is keyed by the commit *and* the verification commands:
+correcting the commands re-verifies the same commit, and passing `--verify`
+again forces a re-run after an environment fix.
+
+The hold applies on every path. `reconcile` and `adopt` never integrate a
+receipt directly; the receipt pass inside `actions` does it, after the red-base
+check — one waiting receipt used to merge onto a red base and produce two
+repair actions for one worktree.
+
+### Why leases are 7200 s of silence
 
 A claim's lease is **7200 s (2 h)** — there is no CLI flag and no renewal entry
-point (the constructor takes an override, used by tests only). `expire_execution_attempts()` runs before every batch: an
-attempt whose lease ran out is marked `unknown` with
-`failure_code=lease-expired`, and its ticket is claimable again on that same
-`actions()` call (the retry supersedes the stale attempt). A ticket that
-legitimately needs longer than two hours therefore always surfaces as
-`lease-expired` and is re-dispatched instead of silently deadlocking.
+point a subagent could call (the constructor takes an override, used by tests
+only). It is not two hours of wall clock, though: the dispatch prompt tells the
+subagent to refresh a heartbeat file after each milestone, and baton also reads
+the worktree (a freshly edited file, a new commit). Recent activity moves the
+deadline; `expire_execution_attempts()` runs before every batch and marks an
+attempt `unknown` with `failure_code=lease-expired` only once it has been
+silent for that long. Activity can keep an attempt alive for at most three
+leases (6 h), so a zombie that keeps touching files still ends.
 
-### Why isolated worktrees solve the concurrency problem
+A ticket that goes silent is therefore re-dispatched without racing a subagent
+that is merely slow — and without silently deadlocking on one that died.
 
-Each assignment gets its own branch + worktree
-(`<project>-baton-<change>-tic-NNN-aNN`). A shared integration worktree
-(`<project>-baton-<change>-integration`) merges sealed branches serially under
-a repository-scoped lock. Merge conflicts are **preserved** (never auto-aborted) and
-surfaced as `resolve_merge` actions for a dedicated subagent to resolve.
+### Why automatic retries have a budget
+
+An expired lease is retryable: the next `actions` supersedes the stale attempt
+and re-claims the ticket. Before 0.5.0 that loop had no ceiling and left no
+trace. Now a ticket gets **3 automatic attempts** (`MAX_ATTEMPTS_PER_TICKET`);
+each retry is announced in the batch's `warnings` (`lease-expired-retried`,
+carrying the stale attempt's `agent_id` so the session can stop a subagent that
+is still running), and once the budget is spent the `recover` blocks for an
+operator — `reopen <N.M>` grants a fresh budget. The budget counts every
+attempt, so a ticket retired by hand three times is locked out too; it then
+surfaces as `blocked: retry-budget-spent` instead of silently leaving the run
+incomplete with nothing to say.
+
+One ``actions()`` call judges each lease exactly once (the sweep at its top);
+the claim at its end does not judge again, or an attempt whose lease ran out
+in between would be re-issued and replaced in the same batch.
 
 ## The Loop
 
@@ -84,7 +130,8 @@ main session (mechanical forwarder)
   ├─ bind         → bind the agent_id to the assignment
   ├─ wait         → wait for the subagent terminal lifecycle event
   └─ reconcile    → session_control.py <project> <change> reconcile ...
-                    sealed receipt → succeeded + integrated; otherwise unknown + recover
+                    sealed receipt → integrate → verify the merged tree → succeeded;
+                    otherwise unknown + recover
 ```
 
 The main session adds **no** orchestration of its own. It forwards the
@@ -92,35 +139,65 @@ deterministic actions verbatim and reports objective lifecycle events back.
 The cognitive phase is the project's OpenSpec workflow — baton has no
 self-built Grill/Brief/approval state machine.
 
+## Attempt States
+
+Every state is live; nothing is listed that the machine does not write.
+
+| State | Meaning | Leaves by |
+|---|---|---|
+| `leased` | claimed, no agent bound yet | `bind` → `spawned`; lease expiry → `unknown`; retire |
+| `spawned` | an agent is bound and working | receipt integrated → `succeeded`; expiry → `unknown`; retire |
+| `integrating` | a sealed receipt is being verified and merged | `succeeded`; `blocked-review` |
+| `blocked-review` | parked on recorded failure evidence (a preserved conflict, a branch that moved after the seal, a red merged tree, a redefined ticket); never expires | repair / resolve / restore → resumes; `abandon` |
+| `unknown` | no receipt and no live lease; needs an operator unless the ticket still has retry budget | retry (superseded), `superseded-by-receipt`, `reopen` |
+| `succeeded` | terminal: verified, integrated, `[x]` written | `reopen` voids the receipt |
+| `superseded` | terminal: replaced by a retry or a reopen | `adopt` if a valid receipt arrives late |
+| `abandoned` | terminal: operator escape hatch | `adopt` if a valid receipt arrives late |
+
+`ACTIVE_ATTEMPT_STATES` (`store_base.py`) is the single source for "owns the
+ticket": capacity counting and the one-active-attempt-per-ticket index (the
+SQL is generated from it) both read it.
+
 ## Module Dependencies
 
 ```
 session_controller.py ──→ plan_store.py (durable: queue.db)
-   │   │   │   │
-   │   │   │   └──→ relay.py (read-only liveness judgments)
-   │   │   └──→ integrator.py ──→ worktree.py (git)
-   │   └──────→ receipt.py (verify/seal — the subagent CLI)
-   └──────────→ session_model.py (action/attempt contracts)
+   │   │   └──→ receipt_flow.py ──→ integrator.py ──→ worktree.py (git)
+   │   │                                 └──→ relay.py (read-only liveness judgments)
+   │   ├──→ lease_flow.py ──→ relay.py, plan_store.py
+   │   ├──→ dispatch_flow.py ──→ worktree.py, relay.py (heartbeat path)
+   │   ├──→ operator_flow.py ──→ relay.py, orchestration.receipt, receipt_flow.py
+   │   └──→ run_settings.py ──→ plan_store.py (run_settings table)
 plan_store.py ──→ _ticket.py (OpenSpec tasks.md parser)
-plan_store.py ──→ _frontier.py (shared frontier judgment, via attempt_store)
+plan_store.py ──→ attempt_store.py ──→ _frontier.py (shared frontier judgment)
+plan_store.py ──→ budget_store.py (lease renewal, retry budget, reopen)
 ticket_board.py ──→ _frontier.py (DAG frontier, observability)
 session_control.py ──→ session_controller.py (thin CLI adapter)
-session_controller.py / integrator.py / worktree.py / receipt.py ──→ git_run.py
-  (the single git subprocess wrapper; every caller picks its own error type)
+every git call ──→ git_run.py (the single subprocess wrapper)
 ```
 
-- `plan_store.py`: durable plan store (`queue.db`) — plan revisions (synced
-  from tasks.md edits), execution attempts, leases, sealed receipts,
-  completion facts.
-- `relay.py`: read-only relay judgments — elapsed vs the lease budget,
-  receipt existence, worktree/heartbeat liveness, the suggested action, and
-  the abandon guard verdict; feeds `status` and the abandon guard without
-  writing state.
+- `session_controller.py`: the scheduling loop — `actions` (two passes:
+  reconcile sealed receipts, then resolve stale attempts and claim) and
+  `reconcile`.
+- `receipt_flow.py`: sealed-receipt reconciliation — verify, integrate, verify
+  the merged tree, finalize; the ticket-redefinition guard; the red-base check.
+- `lease_flow.py`: lease renewal from activity, retry budgets, recover actions.
+- `dispatch_flow.py`: the assignment worktree, the immutable packet and the
+  dispatch prompt.
+- `operator_flow.py`: `abandon`, `adopt`, `reopen`.
+- `run_settings.py`: what a run remembers between calls (verification commands,
+  capacity, base branch) and how the integration branch relates to its base.
+- `plan_store.py` / `attempt_store.py`: durable plan store (`queue.db`) — plan
+  revisions (synced from tasks.md), execution attempts, leases, sealed receipts,
+  run settings, completion facts.
+- `relay.py`: read-only relay judgments — elapsed vs the lease budget, receipt
+  existence, worktree/heartbeat activity, the suggested action, and the abandon
+  guard verdict; `activity_epoch` is also what renews a lease.
 - `_ticket.py`: OpenSpec tasks.md parsing — the ticket source the plan store
   reads on every sync.
 - `_frontier.py`: DAG frontier — `compute_frontier` labels claimable cards on
   the board, and the shared `is_frontier_ticket` predicate drives the claim
-  loop in `attempt_store.py`, so board and claim cannot drift apart.
+  loop, so board and claim cannot drift apart.
 
 ## Why the plan face is OpenSpec tasks.md
 
@@ -132,9 +209,22 @@ session_controller.py / integrator.py / worktree.py / receipt.py ──→ git_r
   are parallel) is the safe default and needs zero extra syntax.
 - Checkbox state is the status: `[x]` resolved, `[ ]` ready. Baton's only
   write-back is flipping a checkbox on integration — no dual status fields to
-  drift.
+  drift. The flip is an uncommitted edit in the main working tree; commit it
+  with the merge.
+- Packets are immutable, so a task whose text is edited while in flight is
+  parked for an operator instead of being delivered against wording nobody
+  implemented.
 
 See [ticket-format.md](ticket-format.md) for the exact parsing rules.
+
+## Repository Boundary
+
+`<project>` must be the root of its own git repository. Baton creates
+`baton/*` branches and worktrees at the repository root and hands each
+subagent a whole-repository checkout; pointed at a directory inside some other
+repository it used to adopt that repo silently. It now refuses, and the
+`.dsh/baton/` exclusion it writes is repository-relative and verified with git
+itself.
 
 ## History
 
@@ -143,4 +233,5 @@ See [ticket-format.md](ticket-format.md) for the exact parsing rules.
 - **v3** — subprocesses replaced by subagents, but coordination used a shared PRD + `passes:true` flags. This caused overwrite-induced ticket loss, batches mis-marked complete, and double-writes.
 - **v4** — `SessionController` is the sole deterministic scheduler. No PRD, no `passes` flags, isolated worktrees, sealed receipts, capacity-≤3 sliding window (3 was the cap at the time; the whole repository is ≤5 now). Ralph permanently retired.
 - **v5** — OpenSpec is the single plan face: tasks.md is the ticket source, the self-built cognitive layer (CompleteFlow/Grill/Brief/Planner/Approval) and the amendment engine are retired, and live-plan edits are plain tasks.md edits picked up as new plan revisions.
-- **v6 (current)** — the local MCP adapter is dropped: the CLI is the only control surface while the plugin is still iterating (same history as README.md).
+- **v6** — the local MCP adapter is dropped: the CLI is the only control surface while the plugin is still iterating.
+- **v7 (current)** — the merged tree is verified by the controller; leases follow activity; retries have a budget; the CLI speaks one envelope.

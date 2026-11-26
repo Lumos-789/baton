@@ -5,44 +5,17 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 from orchestration.model import TaskPacket  # noqa: E402
 from orchestration.result import ResultEnvelope  # noqa: E402
 from orchestration.session_model import (  # noqa: E402
-    ActionBatch,
-    BlockedAction,
-    CompleteAction,
     DispatchAction,
     ExecutionAttempt,
-    RecoverAction,
-    ResolveMergeAction,
-    WaitAction,
     finalize_task_packet,
 )
-
-
-def test_action_batch_round_trips_every_action_kind():
-    batch = ActionBatch(
-        run_id="RUN-feature",
-        generation=7,
-        state="executing",
-        actions=[
-            DispatchAction("ASG-1", 1, "baton_ticket_001", "/tmp/w1", "do it", "tok", "/tmp/p.json", "hash"),
-            ResolveMergeAction("ASG-2", 2, "/tmp/integration", "resolve", "tok2"),
-            RecoverAction("ASG-3", 3, "receipt exists"),
-            WaitAction("agents running", ["ASG-1"]),
-            BlockedAction("missing-authority", "deploy not approved", 4),
-            CompleteAction(3, [1, 2, 3]),
-        ],
-    )
-
-    restored = ActionBatch.from_dict(batch.to_dict())
-
-    assert restored.to_dict() == batch.to_dict()
-    assert [a.kind for a in restored.actions] == [
-        "dispatch", "resolve_merge", "recover", "wait", "blocked", "complete"
-    ]
 
 
 def test_dispatch_action_contains_host_neutral_prompt_and_cwd():
@@ -108,3 +81,28 @@ def test_execution_attempt_round_trip():
     )
 
     assert ExecutionAttempt.from_dict(attempt.to_dict()) == attempt
+
+
+def test_execution_attempt_from_dict_applies_defaults_for_missing_optional_fields():
+    """A row that predates a field must not surface dataclasses.MISSING."""
+    attempt = ExecutionAttempt.from_dict(
+        {
+            "assignment_id": "ASG-feature-001-r1-a1",
+            "run_id": "RUN-feature",
+            "ticket_num": 1,
+            "attempt": 1,
+            "state": "leased",
+            "session_id": "session-1",
+            "plan_revision": 1,
+            "task_packet_hash": "hash",
+            "claim_token": "token",
+            "lease_expires_at": "2026-08-08T10:00:00+00:00",
+            "base_branch": "main",
+            "base_sha": "abc",
+        }
+    )
+
+    assert attempt.worktree_path == ""
+    assert isinstance(attempt.created_at, str) and attempt.created_at
+    with pytest.raises(KeyError):
+        ExecutionAttempt.from_dict({"assignment_id": "ASG-x"})

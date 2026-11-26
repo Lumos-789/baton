@@ -9,7 +9,8 @@
 
 > OpenSpec 变更唯一的 ticket / DAG / 会话子代理控制面。
 > 本地 CLI 返回确定性的会话动作；主会话用 DSH `subagent` 工具派发每个任务包、
-> 绑定子代理 id，并依据密封回执（sealed receipt）结算完成通知。
+> 绑定子代理 id，并依据密封回执（sealed receipt）结算完成通知。控制器还会在
+> 合并后的集成分支上重跑验证命令，通过后票据才落定。
 
 **[Discussions](https://github.com/Lumos-789/baton/discussions)**
 
@@ -18,8 +19,9 @@
 OpenSpec 擅长规格驱动的分解（proposal -> tasks -> archive），但不负责执行。
 Baton 把一个已批准的变更确定性地变成完成的工作：主会话从不自行决定 ticket 状态，
 而是原样转发 Baton CLI 返回的确定性 `actions` 给 DSH 子代理，再把每个完成
-通知对照**密封回执**（任务的验证命令在隔离 worktree 中全绿）结算。子代理的自由文本
-输出不被采信。
+通知对照**密封回执**（任务的验证命令在隔离 worktree 中全绿）结算，并在**合并后**的
+集成分支上重跑这些命令，通过后票据才落定——两条各自全绿的分支合起来仍可能互相弄坏。
+子代理的自由文本输出不被采信。
 
 密封回执是 `receipt.py` 在本地产生的哈希绑定证据（任务包哈希 + 干净前进的 HEAD +
 退出码为 0 的验证结果）。整份回执正文由规范化 `sha256` 摘要（`receiptHash`）覆盖：
@@ -32,7 +34,7 @@ Baton 把一个已批准的变更确定性地变成完成的工作：主会话�
 |---|---|
 | 依赖（按 section 顺序的 DAG -> 下一步跑什么） | `SessionController.actions()` 每次调用重算前沿并原子认领不同任务 |
 | 并发（<=5 个并行任务） | 每个任务一个隔离 git worktree；集成由仓库级锁串行化 |
-| 状态（子代理结束 -> 任务完成） | 密封回执是唯一成功证据；控制器集成分支、落定尝试、回写 tasks.md 的 `[x]` |
+| 状态（子代理结束 -> 任务完成） | 密封回执是唯一成功证据；控制器集成分支、复验合并结果、落定尝试、回写 tasks.md 的 `[x]` |
 
 **Baton 是指挥。`SessionController` 是唯一确定性调度器；主会话是机械转发器；
 OpenSpec 是计划面。**
@@ -110,17 +112,18 @@ run baton on <project_path> <change-id>
   |- session_control.py <project> <change> actions --session-id ... --capacity<=5
   |     -> SessionController.actions()：恢复/结算密封回执、计算前沿、原子认领、
   |        准备隔离 worktree 与不可变任务包，返回
-  |        dispatch/recover/resolve_merge/wait/blocked/complete 动作
+  |        dispatch/recover/resolve_merge/repair_integration/wait/blocked/complete
+  |        动作与 warnings
   |- subagent(dispatch.prompt, cwd=dispatch.cwd) -> 子代理 id
   |- session_control.py <project> <change> bind <assignment_id> <claim_token> <agent_id>
   |- 运行时送达子代理完成通知
   `- session_control.py <project> <change> reconcile ... --agent-terminal ...
-        -> 密封回执 -> 成功并集成；否则 unknown + recover
+        -> 密封回执 -> 集成并复验合并结果 -> 成功；否则 unknown + recover
 
 SessionController（唯一确定性调度器）
   |- 持久计划存储（.dsh/baton/queue.db）：修订、尝试、租约、密封回执、完成事实
   |- 隔离的任务 worktree + 共享集成 worktree
-  |- 串行 git 集成；合并冲突保留（从不自动放弃）
+  |- 串行 git 集成，每次合并都在合并结果上复验；冲突保留（从不自动放弃）
   `- 按最新计划判定完成（全部必需 ticket 已验证并集成）
 ```
 
@@ -132,19 +135,24 @@ SessionController（唯一确定性调度器）
 - **隔离 worktree** — 每个任务一个分支；容量 <=5 的滑动窗口；集成由仓库级锁串行。
 - **密封回执** — `scripts/receipt.py` 的 `verify` / `seal` 是唯一被采信的成功
   证据；没有回执的完成通知把尝试翻成 `unknown`。
-- **固定 7200 s 租约** — 认领的租约硬编码为 7200 s（2 小时）：没有 CLI 开关，
-  也没有续租入口。租约超时即判 `lease-expired`（尝试翻成 `unknown` 并带上该
-  `failure_code`），下一次 `actions` 调用会重新派发该 ticket。
+- **租约是 7200 s 的静默** — 认领的租约为 7200 s（2 小时）：没有 CLI 开关，也
+  没有面向子代理的续租入口，但活动会续租（心跳、文件改动、新提交），最多续三个
+  租期。一直静默的尝试判 `lease-expired`，票自动重派——每票最多 3 次，每次重试
+  都在批次的 `warnings` 里明示并带上旧 agent id；被预算挡住的票以
+  `retry-budget-spent` 持续可见，直到 `reopen`。
 - **运维逃生口（双向带护栏）** — `abandon <assignment_id>` 退役卡住的尝试：释放
   租约、取消它参与结算的资格，但 worktree、分支、提交、任务包和回执都留在磁盘
   上供审计。对「可能还在干活」的尝试（在飞、无失败证据、无回执、租约消耗不足
   80%）abandon 默认拒绝并给出判定数据，`--force` 才放行——接手会话无法再悄悄
-  销毁在飞的活。`adopt <assignment_id>` 是反向逃生口：abandon 之后迟到密封的
-  回执可被复活——重新验证后正常入账，不再整票作废（同票已有后继密封证据时
-  adopt 拒绝并列出两份证据，由人二选一）。
-- **接力判定可读** — `status` 为每个尝试输出 `relay` 块：`elapsedSec` /
-  `leaseRemainingSec` / `leaseElapsedFraction`、`receiptExists`、worktree
-  存活信号与 `suggestedAction`（`wait` / `reconcile` / `adopt` / …）。派发
+  销毁在飞的活。`adopt <assignment_id>` 是反向逃生口：被 abandon 或被重试取代的
+  尝试迟到密封的回执可被复活——重新验证后正常入账，不再整票作废（同票已有后继
+  密封证据时 adopt 拒绝并列出两份证据，由人二选一）。`reopen <N.M>` 是已完成票的
+  反向操作：作废该票的成功回执并重置重试预算；手动取消勾选只会被报告
+  （`resolved_but_unchecked`），既不静默照办也不静默忽略。
+- **接力判定可读** — `status` 为每个尝试输出 `relay` 块：`elapsed_sec` /
+  `lease_remaining_sec` / `lease_elapsed_fraction`、`receipt_exists`、worktree
+  存活信号与 `suggested_action`（`wait` / `dispatch` / `reconcile` / `adopt` /
+  `repair-integration` / …）。派发
   prompt 要求子代理在 run 目录（worktree 之外，不会弄脏 seal）刷新
   `progress` 心跳文件，`status` 汇报其年龄——「活着」从数据里读，不靠猜。
 
@@ -152,10 +160,15 @@ SessionController（唯一确定性调度器）
 - **OpenSpec 原生的认知阶段** — “用 baton 完成 X” 指先跑项目的 OpenSpec 工作流
   （对齐 -> 写变更 -> 用户批准），再驱动执行到 `complete`。
 - **活计划 = 直接改 tasks.md** — 运行中增删任务，下一次 `actions()` 记录新计划
-  修订并重算前沿；在飞的任务包保持不可变。
+  修订并重算前沿；在飞的任务包保持不可变——改写仍在途任务的文字会把它停住
+  （`ticket-redefined`），不会拿旧定义的实现去交付新定义。
+- **CLI 统一信封** — 每个动词都输出 `{"ok", "command", ...}`（snake_case 键）；
+  失败带稳定的 `code`，需要据此行动的数据是独立字段。
 - **验证是变更级且持久化** — `--verify "<cmd>"`（顶层参数，可重复）在首次认领时
   随本次运行持久化，之后的任务包（包括 `reconcile` 准备的）都复用它；再次传入
-  即显式覆盖。不存在 per-task 验证覆盖。
+  即显式覆盖。不存在 per-task 验证覆盖。并发度与基线分支同样被记住，`reconcile`
+  省略 `--capacity` 不会让并行运行变窄。验证命令在继承当前环境的普通 shell 里跑
+  （不是登录 shell）；失败会报出退出码与输出尾部，并留在 `verification.json`。
 
 **可观测性**：`scripts/ticket_board.py` 为项目的 OpenSpec 变更生成纯静态 HTML
 看板（零进程、零端口）：
@@ -172,6 +185,11 @@ python3 scripts/ticket_board.py build /path/to/project <change-id>
 点击卡片会显示可复制的 `check` / `uncheck` 命令（任意目录可执行）；一次
 翻转就会就地改写所有已构建的看板——刷新页面即可。
 
+**仓库卫生**：baton 把运行态（`.dsh/baton/`）写进目标仓库的 `info/exclude`，
+使其不进提交——从不碰受控的 `.gitignore`。`cleanup` 会移除已完成运行的 worktree
+和所有可证明已合并的分支，从不删除未合并的分支。`[x]` 回写是主工作区里未提交的
+改动：请连同合并一起提交 `tasks.md`。
+
 ## 包内容
 
 | 路径 | 用途 |
@@ -180,7 +198,7 @@ python3 scripts/ticket_board.py build /path/to/project <change-id>
 | `cordis.patch.yml` | DSH bundle insert 行（`dsh-openspec-baton`） |
 | `.zcode-plugin/plugin.json` | ZCode 插件清单（同一技能） |
 | `skills/baton/SKILL.md` | `baton` 技能（actions -> subagent -> reconcile） |
-| `scripts/session_control.py` | 控制面 CLI（`actions`/`bind`/`reconcile`/`status`/`cleanup`/`abandon`/`adopt`） |
+| `scripts/session_control.py` | 控制面 CLI（`actions`/`bind`/`reconcile`/`status`/`cleanup`/`abandon`/`adopt`/`reopen`） |
 | `scripts/` | 确定性控制器、计划存储、回执 |
 
 ## 历史
@@ -189,14 +207,15 @@ Baton v1 驱动外部的 `ralph.sh` 循环。v2 把循环搬进 Python。v3 用�
 子进程模型，但仍然依赖共享 PRD + `passes` 标记。v4 退役 PRD/passes 协议，让
 `SessionController` 成为唯一确定性调度器。v5 把 OpenSpec 采纳为唯一的计划面：
 变更的 `tasks.md` 就是 ticket 源（按 section 顺序的 DAG、`[x]` 回写），自建的
-认知/修订引擎随之退役。**v6（当前）** 去掉本地 MCP 适配层：插件仍在迭代期，
-CLI 是唯一的控制面。
+认知/修订引擎随之退役。v6 去掉本地 MCP 适配层，CLI 是唯一的控制面。
+**v7（当前）** 复验合并结果、按活动续租、限制自动重试、CLI 统一信封。
 
 ## 要求
 
 - **DSH** `0.2.1-rc.2` 或更新，且 `subagent` 可用（`dsh-base`）
 - **Python 3.10+**（macOS/Linux 上的 `python3`、Windows 上的 `python`）+ pytest
-- 一个 **git** 目标仓库（控制器要在其中准备隔离 worktree）
+- 一个 **git** 目标仓库——必须是仓库根目录，不能是别的仓库里的子目录
+  （控制器要在其中准备隔离 worktree）
 - 目标项目使用 **OpenSpec**（`openspec/changes/<id>/tasks.md`）
 
 ## 回归

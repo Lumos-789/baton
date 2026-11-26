@@ -10,7 +10,9 @@
 > The sole ticket / DAG / session-subagent control plane over OpenSpec changes.
 > A local CLI exposes deterministic session actions; the main session
 > delegates each assignment with the DSH `subagent` tool, binds the child id,
-> and reconciles the completion notice against a sealed receipt.
+> and reconciles the completion notice against a sealed receipt. A ticket lands
+> only after the controller also re-runs the verification commands on the
+> merged integration branch.
 
 **[Discussions](https://github.com/Lumos-789/baton/discussions)**
 
@@ -22,7 +24,9 @@ deterministically: the main session never decides ticket state itself. It
 forwards the deterministic `actions` returned by the Baton CLI to DSH
 subagents verbatim, then reconciles each completion notice against a **sealed
 receipt** (the assignment's verification commands run green in an isolated
-worktree). Free-text subagent output is ignored.
+worktree), and re-runs those commands on the **merged** integration branch
+before the ticket lands - two branches that are green alone can still break
+each other. Free-text subagent output is ignored.
 
 A sealed receipt is hash-bound evidence produced locally by `receipt.py`
 (task-packet hash + clean, advanced HEAD + exit-0 verification results). The
@@ -38,7 +42,7 @@ assignment ~ one task), and three seams are bridged deterministically:
 |---|---|
 | Dependency (section-order DAG -> what to run next) | `SessionController.actions()` computes the frontier fresh every call and atomically claims distinct tasks |
 | Concurrency (<=5 parallel tasks) | one isolated git worktree per assignment; integration serialized by a repository-scoped lock |
-| State (subagent done -> task resolved) | a sealed receipt is the only success evidence; the controller integrates the branch, finalizes the attempt, and flips the task's `[x]` in tasks.md |
+| State (subagent done -> task resolved) | a sealed receipt is the only success evidence; the controller integrates the branch, verifies the merged tree, finalizes the attempt, and flips the task's `[x]` in tasks.md |
 
 **Baton is the conductor. `SessionController` is the sole deterministic
 scheduler; the main session is a mechanical forwarder; OpenSpec is the plan
@@ -123,18 +127,20 @@ main session (mechanical forwarder - no model-driven state decisions)
   |     -> SessionController.actions(): recover/reconcile sealed receipts,
   |        compute frontier, atomically claim, prepare isolated worktrees +
   |        immutable Task Packets, return dispatch/recover/resolve_merge/
-  |        wait/blocked/complete actions
+  |        repair_integration/wait/blocked/complete actions + warnings
   |- subagent(dispatch.prompt, cwd=dispatch.cwd) -> child id
   |- session_control.py <project> <change> bind <assignment_id> <claim_token> <agent_id>
   |- runtime sends the subagent completion notice
   |- session_control.py <project> <change> reconcile ... --agent-terminal ...
-        -> sealed receipt -> succeeded + integrated; otherwise unknown + recover
+        -> sealed receipt -> integrated + merged tree verified -> succeeded;
+           otherwise unknown + recover
 
 SessionController (the sole deterministic scheduler)
   |- durable plan store (.dsh/baton/queue.db): revisions, attempts, leases,
   |  sealed receipts, completion facts
   |- isolated assignment worktrees + a shared integration worktree
-  |- serial git integration; merge conflicts preserved (never auto-aborted)
+  |- serial git integration, every merge verified on the merged tree;
+  |  conflicts preserved (never auto-aborted)
   `- latest-plan completion (all required tickets verified + integrated)
 ```
 
@@ -148,10 +154,13 @@ SessionController (the sole deterministic scheduler)
 - **Sealed receipts** - `scripts/receipt.py verify` / `seal` is the only
   accepted success evidence; a completion notice without a receipt flips the
   attempt to `unknown`.
-- **Fixed 7200 s leases** - a claim's lease is hardcoded to 7200 s (2 h): there
-  is no CLI flag and no renewal entry point. A lease that runs out is judged
-  `lease-expired` (the attempt flips to `unknown` with that `failure_code`) and
-  the ticket is re-dispatched by the next `actions` call.
+- **Leases are 7200 s of silence** - a claim's lease is 7200 s (2 h): there is
+  no CLI flag and no subagent-facing renewal call, but activity renews it (the
+  heartbeat, edited files, new commits) for at most three leases. An attempt
+  that stays silent is judged `lease-expired` and the ticket is re-dispatched
+  automatically - at most 3 attempts per ticket, each announced in the batch's
+  `warnings` together with the stale agent id; a locked-out ticket stays
+  visible as `retry-budget-spent` until `reopen`.
 - **Operator escape hatches, both guarded** - `abandon <assignment_id>` retires
   a stuck attempt: it releases the lease and drops the attempt's eligibility
   for reconcile, while its worktree, branch, commits, packet and receipt stay
@@ -159,13 +168,17 @@ SessionController (the sole deterministic scheduler)
   (active, no failure evidence, no receipt, less than 80% of its lease spent)
   is refused with the judgment data unless `--force` - so a session taking
   over a run cannot silently destroy live work. `adopt <assignment_id>` is the
-  reverse hatch: an abandoned attempt whose sealed receipt arrived late is
-  re-verified and integrated instead of thrown away (a newer sealed successor
-  refuses the adopt and lists both evidence sets for a human choice).
+  reverse hatch: an abandoned or superseded attempt whose sealed receipt
+  arrived late is re-verified and integrated instead of thrown away (a newer
+  sealed successor refuses the adopt and lists both evidence sets for a human
+  choice). `reopen <N.M>` is the reverse of a finished ticket: it voids the
+  ticket's succeeded receipts and restarts its retry budget. A manual un-check
+  is reported (`resolved_but_unchecked`), never silently honored or ignored.
 - **Relay-safe judgments** - `status` shows per attempt a `relay` block:
-  `elapsedSec` / `leaseRemainingSec` / `leaseElapsedFraction`,
-  `receiptExists`, worktree liveness signals and a `suggestedAction`
-  (`wait` / `reconcile` / `adopt` / ...). The dispatch prompt tells subagents
+  `elapsed_sec` / `lease_remaining_sec` / `lease_elapsed_fraction`,
+  `receipt_exists`, worktree liveness signals and a `suggested_action`
+  (`wait` / `dispatch` / `reconcile` / `adopt` / `repair-integration` / ...).
+  The dispatch prompt tells subagents
   to refresh a `progress` heartbeat in the run directory (outside the
   worktree, so it never dirties a seal), and `status` reports its age -
   "alive" is read from data, not guessed.
@@ -177,11 +190,19 @@ SessionController (the sole deterministic scheduler)
   Grill/Brief/approval state machine.
 - **Live plan = edit tasks.md** - add tasks or sections at runtime; the next
   `actions()` call records a new plan revision and the frontier is recomputed.
-  In-flight packets stay immutable.
+  In-flight packets stay immutable; changing the text of a task that is still
+  in flight parks its attempt (`ticket-redefined`) instead of delivering the
+  old wording against the new definition.
+- **One CLI envelope** - every verb prints `{"ok", "command", ...}` with
+  snake_case keys; a failure carries a stable `code` and its data as fields.
 - **Verification is change-wide and persisted** - `--verify "<cmd>"` (top-level,
   repeatable) is persisted with the run on the first claim, so later packets -
   including ones prepared by `reconcile` - reuse it; passing it again is an
-  explicit override. There is no per-task verification override.
+  explicit override. There is no per-task verification override. Capacity and
+  base branch are remembered the same way, so a `reconcile` that omits
+  `--capacity` keeps a parallel run parallel. Commands run in a plain shell
+  that inherits the caller's environment (no login shell); a failure reports
+  its exit code and output tail and leaves them in `verification.json`.
 
 **Observability**: `scripts/ticket_board.py` produces a pure static HTML
 Kanban board over a project's OpenSpec changes (zero process, zero port,
@@ -201,6 +222,13 @@ Clicking a card shows the copy-paste `check` / `uncheck` commands (runnable
 from any directory); a flip rewrites any built board in place — just reload
 the page.
 
+**Repository hygiene**: baton keeps its runtime state (`.dsh/baton/`) out of
+the target project's commits by appending it to the repository's
+`info/exclude` — a tracked `.gitignore` is never touched. `cleanup` removes a
+finished run's worktrees and every branch that provably merged, and never
+deletes an unmerged one. The `[x]` write-back is an uncommitted edit in the
+main working tree: commit `tasks.md` together with the merge.
+
 ## Bundle contents
 
 | Path | Purpose |
@@ -209,7 +237,7 @@ the page.
 | `cordis.patch.yml` | DSH bundle insert row (`dsh-openspec-baton`) |
 | `.zcode-plugin/plugin.json` | ZCode plugin manifest (same skill) |
 | `skills/baton/SKILL.md` | the `baton` skill (actions -> subagent -> reconcile) |
-| `scripts/session_control.py` | the control-plane CLI (`actions`/`bind`/`reconcile`/`status`/`cleanup`/`abandon`/`adopt`) |
+| `scripts/session_control.py` | the control-plane CLI (`actions`/`bind`/`reconcile`/`status`/`cleanup`/`abandon`/`adopt`/`reopen`) |
 | `scripts/` | deterministic controller, plan store, receipts |
 
 ## History
@@ -220,14 +248,16 @@ v3 replaced the subprocess model with subagents but still used a shared PRD +
 `SessionController` the sole deterministic scheduler. v5 adopted
 OpenSpec as the single plan face - the change's `tasks.md` is the ticket source
 (section-order DAG, `[x]` write-back), and the self-built cognitive/amendment
-engines are retired. **v6 (current)** drops the local MCP adapter: the CLI is
-the only control surface while the plugin is still iterating.
+engines are retired. v6 drops the local MCP adapter: the CLI is the only
+control surface. **v7 (current)** verifies the merged tree, renews leases by
+activity, bounds automatic retries, and speaks one CLI envelope.
 
 ## Requirements
 
 - **DSH** `0.2.1-rc.2` or newer, with `subagent` available (`dsh-base`)
 - **Python 3.10+** (`python3` on macOS/Linux, `python` on Windows) + pytest
-- A **git** target project (the controller prepares isolated worktrees)
+- A **git** target project — its repository root, not a directory inside
+  another repository (the controller prepares isolated worktrees)
 - The target project uses **OpenSpec** (`openspec/changes/<id>/tasks.md`)
 
 ## Regression

@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""CLI adapter for the deterministic SessionController."""
+"""CLI adapter for the deterministic SessionController.
+
+Every verb prints one JSON object. Success is ``{"ok": true, "command": "<verb>",
+...}`` with snake_case keys; a domain failure is ``{"ok": false, "command",
+"code", "error", ...}``. ``code`` is the stable machine-readable cause and
+whatever a model must act on is a field of its own — never JSON inside a
+string.
+"""
 
 from __future__ import annotations
 
@@ -17,14 +24,17 @@ from orchestration.session_controller import (  # noqa: E402
     SessionController,
     SessionControllerError,
 )
+from orchestration.store_base import BASE_BRANCH_SETTING  # noqa: E402
 from orchestration.worktree import (  # noqa: E402
     WorktreeError,
     cleanup_feature_worktrees,
 )
 
-# Domain failures the CLI renders as one JSON error line; anything else
+# Domain failures the CLI renders as one JSON error object; anything else
 # (TypeError, bugs) keeps its full traceback — fail loud, just not ugly.
 DOMAIN_ERRORS = (PlanStoreError, SessionControllerError, WorktreeError)
+
+VERBS = ("actions", "bind", "reconcile", "status", "cleanup", "abandon", "adopt", "reopen")
 
 
 def _controller(args: argparse.Namespace) -> SessionController:
@@ -58,16 +68,32 @@ def _capacity(value: str) -> int:
     return capacity
 
 
+def _non_empty(value: str) -> str:
+    """argparse type: an agent id names the child that was just spawned."""
+    if not value.strip():
+        raise argparse.ArgumentTypeError("agent id must be a non-empty string")
+    return value
+
+
+def _ticket_id(value: str) -> str:
+    """argparse type: a ticket is named the way tasks.md names it."""
+    parts = value.split(".")
+    if len(parts) != 2 or not all(part.isdigit() for part in parts):
+        raise argparse.ArgumentTypeError(
+            f"ticket id must look like N.M (e.g. 2.1), got {value!r}"
+        )
+    return value
+
+
 def _print(value: object) -> None:
-    if hasattr(value, "to_dict"):
-        value = value.to_dict()
     print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
 
 
-def _ok(value: object) -> dict[str, object]:
+def _envelope(value: object, command: str) -> dict[str, object]:
     if hasattr(value, "to_dict"):
         value = value.to_dict()
-    return {"ok": True, **value} if isinstance(value, dict) else {"ok": True}
+    payload = value if isinstance(value, dict) else {}
+    return {"ok": True, "command": command, **payload}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -86,13 +112,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     actions = sub.add_parser("actions")
     actions.add_argument("--session-id", required=True, type=_session_id)
-    actions.add_argument("--capacity", type=_capacity, default=1)
-    actions.add_argument("--base-branch", default="main")
+    actions.add_argument(
+        "--capacity",
+        type=_capacity,
+        help="parallel assignments, 1-5 (default: what the run stored, else 1); "
+        "an explicit value is stored with the run",
+    )
+    actions.add_argument(
+        "--base-branch",
+        help="branch the integration branch starts from (default: what the run "
+        "stored, else main); an explicit value is stored with the run",
+    )
 
     bind = sub.add_parser("bind")
     bind.add_argument("assignment_id")
     bind.add_argument("claim_token")
-    bind.add_argument("agent_id")
+    bind.add_argument("agent_id", type=_non_empty)
 
     reconcile = sub.add_parser("reconcile")
     reconcile.add_argument("assignment_id")
@@ -103,8 +138,14 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["completed", "failed", "canceled"],
     )
     reconcile.add_argument("--session-id", required=True, type=_session_id)
-    reconcile.add_argument("--capacity", type=_capacity, default=1)
-    reconcile.add_argument("--base-branch", default="main")
+    reconcile.add_argument("--capacity", type=_capacity)
+    reconcile.add_argument("--base-branch")
+    reconcile.add_argument(
+        "--reason",
+        default="",
+        help="one line on why the subagent ended without a sealed receipt; "
+        "recorded for diagnosis only (never decides success)",
+    )
 
     sub.add_parser(
         "status",
@@ -113,28 +154,31 @@ def build_parser() -> argparse.ArgumentParser:
 
     cleanup = sub.add_parser(
         "cleanup",
-        help="remove a finished run's worktrees (assignment branches "
-        "baton/<feature>-tic-*); never touches the main working tree, "
-        "never force-removes dirty worktrees",
+        help="remove a finished run's worktrees and the branches that provably "
+        "merged (assignment branches baton/<feature>-tic-*); never touches the "
+        "main working tree, never force-removes dirty worktrees, never deletes "
+        "an unmerged branch",
     )
     cleanup.add_argument(
         "--include-integration",
         action="store_true",
-        help="also remove the baton/<feature> integration worktree (only after merging to main)",
+        help="also remove the baton/<feature> integration worktree, and delete "
+        "that branch once it is merged into the base branch",
     )
     cleanup.add_argument(
         "--dry-run",
         action="store_true",
-        help="preview: list the worktrees cleanup would remove, remove nothing",
+        help="preview: list the worktrees and branches cleanup would remove, "
+        "remove nothing",
     )
 
     abandon = sub.add_parser(
         "abandon",
         help="operator escape hatch: retire a stuck attempt (releases its lease, "
-        "ignores future receipts); it does NOT delete the worktree, branch, "
-        "commits, packet or receipt; refused while the attempt is plausibly "
-        "still working (active + no failure evidence + most of its lease left) "
-        "unless --force",
+        "ignores future receipts unless adopted); it does NOT delete the "
+        "worktree, branch, commits, packet or receipt; refused while the attempt "
+        "is plausibly still working (active + no failure evidence + most of its "
+        "lease left) unless --force",
     )
     abandon.add_argument("assignment_id")
     abandon.add_argument(
@@ -150,11 +194,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     adopt = sub.add_parser(
         "adopt",
-        help="revive an abandoned attempt whose sealed receipt arrived late: "
-        "re-verify the receipt and integrate it; refuses when a newer attempt "
-        "for the same ticket already sealed or is still in flight",
+        help="revive an abandoned or superseded attempt whose sealed receipt "
+        "arrived late: re-verify the receipt and integrate it; refuses when a "
+        "newer attempt for the same ticket already sealed or is still in flight",
     )
     adopt.add_argument("assignment_id")
+
+    reopen = sub.add_parser(
+        "reopen",
+        help="re-run a finished ticket: void its succeeded receipts so the next "
+        "actions call claims it again (also restarts a spent retry budget); "
+        "refused while an attempt for the ticket is still active",
+    )
+    reopen.add_argument("ticket", metavar="N.M", type=_ticket_id)
 
     return parser
 
@@ -163,18 +215,18 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        if args.command == "cleanup":
-            _print(
-                cleanup_feature_worktrees(
-                    args.project,
-                    args.feature,
-                    include_integration=args.include_integration,
-                    dry_run=args.dry_run,
-                )
-            )
-            return 0
         controller = _controller(args)
-        if args.command == "actions":
+        if args.command == "cleanup":
+            result = cleanup_feature_worktrees(
+                args.project,
+                args.feature,
+                include_integration=args.include_integration,
+                dry_run=args.dry_run,
+                base_branch=controller.store.peek_run_setting(BASE_BRANCH_SETTING)
+                or "main",
+                ran_before=controller.store.has_run_history(),
+            )
+        elif args.command == "actions":
             result = controller.actions(args.session_id, args.capacity, args.base_branch)
         elif args.command == "bind":
             result = controller.bind_agent(
@@ -188,6 +240,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.command == "adopt":
             result = controller.adopt(args.assignment_id)
+        elif args.command == "reopen":
+            result = controller.reopen(args.ticket)
         else:
             result = controller.reconcile(
                 args.assignment_id,
@@ -196,11 +250,20 @@ def main(argv: list[str] | None = None) -> int:
                 session_id=args.session_id,
                 capacity=args.capacity,
                 base_branch=args.base_branch,
+                reason=args.reason,
             )
-        _print(_ok(result))
+        _print(_envelope(result, args.command))
         return 0
     except DOMAIN_ERRORS as exc:
-        _print({"error": f"{type(exc).__name__}: {exc}", "command": args.command})
+        _print(
+            {
+                "ok": False,
+                "command": args.command,
+                "code": getattr(exc, "code", type(exc).__name__),
+                "error": f"{type(exc).__name__}: {exc}",
+                **getattr(exc, "details", {}),
+            }
+        )
         return 1
 
 

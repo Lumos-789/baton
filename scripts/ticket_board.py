@@ -42,6 +42,7 @@ from _ticket import (  # noqa: E402
 )
 from _frontier import compute_frontier  # noqa: E402
 from orchestration.plan_model import utc_now  # noqa: E402
+from orchestration.worktree import exclude_runtime_dir  # noqa: E402
 
 
 def _tasks_path(project: str | Path, feature: str) -> Path:
@@ -102,6 +103,7 @@ def scan_board(project: str | Path, feature: str) -> dict:
 def save_board(project: str | Path, feature: str) -> dict:
     board = scan_board(project, feature)
     if "error" not in board:
+        exclude_runtime_dir(project)
         path = _board_path(project, feature)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
@@ -202,6 +204,7 @@ def save_board_all(project: str | Path) -> dict:
     """
     board = scan_all(project)
     if board.get("tickets") or board.get("skipped_changes"):
+        exclude_runtime_dir(project)
         path = Path(project).resolve() / ".dsh" / "baton" / "board-all.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
@@ -425,6 +428,7 @@ def cmd_build_all(args):
                 file=sys.stderr,
             )
         return 1
+    exclude_runtime_dir(args.project)
     out_path = Path(args.project).resolve() / ".dsh" / "baton" / "board-all.html"
     out_path.write_text(_render_html(board), encoding="utf-8")
     print(f"Global board generated: {out_path}")

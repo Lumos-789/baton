@@ -72,7 +72,9 @@ def _setup(tmp_path: Path, *, commands: list[str] | None = None) -> tuple[Path, 
 
 
 def test_shell_command_uses_posix_sh():
-    assert shell_command("echo hi", platform="posix") == ["/bin/sh", "-lc", "echo hi"]
+    # Not a login shell: macOS path_helper rebuilds PATH for one, which moves
+    # `python3` to the system interpreter and drops the caller's toolchain.
+    assert shell_command("echo hi", platform="posix") == ["/bin/sh", "-c", "echo hi"]
 
 
 def test_shell_command_uses_powershell_on_windows():

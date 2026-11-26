@@ -36,7 +36,9 @@ feature; a task is a ticket.
 ### Parsing rules
 
 - `## N. Section title` starts section N (a `。` after the number is
-  tolerated for CJK writing).
+  tolerated for CJK writing). The next top-level heading (`#` or `##`) that is
+  not a numbered section ends it; deeper headings (`###`) belong to it.
+- A UTF-8 byte-order mark is tolerated: it does not hide the first section.
 - Task lines: `- [ ] N.M text` / `- [x] N.M text`. Bullets `-`/`*`/`+` and
   checkbox states `[ ]`/`[x]`/`[X]` are all tolerated.
 - A task line only counts inside a section; stray checkboxes before the
@@ -46,6 +48,12 @@ feature; a task is a ticket.
   phantom misfiled/duplicate ids).
 - A checkbox with a task id but no description text (``- [ ] 1.2``) is a
   validation error, not a silently dropped ticket.
+- **Every top-level checkbox in a section is a ticket.** One without an
+  `N.M` id (``- [ ] write the docs``) is a validation error naming the line —
+  it used to vanish without a word. Indented checkboxes are sub-steps (the
+  usual OpenSpec `verify:` nesting) and are ignored, unless they carry an
+  `N.M` id: an indented ``  - [ ] 1.2 …`` is an error too, because it looks
+  exactly like a task that never ran.
 
 ### Mapping
 
@@ -79,6 +87,10 @@ file order is the safe dependency order. Consequences:
 - task id filed under the wrong section (e.g. `1.2` under `## 2.`)
 - checkbox with a task id but no description text (e.g. `- [ ] 1.2`) → error
   naming the line number
+- top-level checkbox with no task id (e.g. `- [ ] write the docs`) → error
+  naming the line number
+- indented checkbox that carries a task id (e.g. `  - [ ] 1.2 …`) → error
+  naming the line number
 
 ### Write-back
 
@@ -90,11 +102,17 @@ CRLF line endings, so a Windows checkout does not turn one flip into a
 whole-file diff. There is no in-progress projection: live attempt state lives
 in the durable store (`queue.db`), not in the plan face.
 
-### Validation of ids
+The flip is an **uncommitted edit in the project's main working tree** — baton
+never commits to the base branch — and the integration branch does not carry
+it. Commit `tasks.md` together with merging `baton/<change-id>`.
 
-An id outside the supported range (`## 100.`, `1.100`) is a
-`TasksMarkdownError` too — like every other malformed-tasks.md case, it is
-reported as one error line, never as a traceback.
+### A finished ticket stays finished
+
+A succeeded receipt resolves a ticket for good. Unchecking it by hand does not
+re-run it: baton reports the mismatch (`resolved_but_unchecked` in `status`,
+a `resolved-but-unchecked` warning on every batch) instead of quietly
+overriding the edit. `reopen <N.M>` is the explicit way to re-run one: it
+voids the receipt, unchecks the task and restarts the ticket's retry budget.
 
 ## Live edits
 
@@ -102,3 +120,11 @@ Editing tasks.md at runtime (adding tasks/sections, reordering, manual
 checkbox flips) is the live-plan mechanism: the next `actions()` call
 re-reads the file, records a **new plan revision**, and the frontier is
 recomputed. In-flight assignments keep their immutable packets.
+
+Changing the **text** of a task that is still in flight is different: the
+subagent is implementing the old wording, so the attempt is parked
+(`blocked-review`, `blocked: ticket-redefined`) with both texts shown.
+Restore the original text to let it resume, or `abandon` the attempt so the
+ticket is re-claimed under the new definition. A receipt sealed under the old
+text is never integrated against the new one. Removing an in-flight task
+parks its attempt the same way (`blocked: ticket-removed`).

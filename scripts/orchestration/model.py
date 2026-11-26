@@ -26,10 +26,10 @@ class TaskPacket:
     A packet fully describes one unit of work: the goal, how success is
     judged (``acceptance_criteria`` / ``verification_commands`` /
     ``output_contract``), what it depends on (``dependencies`` /
-    ``base_commit`` / ``artifacts``), where it may touch
-    (``project_path``). ``plan_revision`` binds the
-    packet to the Live Plan revision that produced it; ``task_packet_hash``
-    is the canonical content hash callers use for idempotency.
+    ``base_commit``), and where it runs (``project_path``).
+    ``plan_revision`` binds the packet to the Live Plan revision that
+    produced it; ``task_packet_hash`` is the canonical content hash callers
+    use for idempotency.
     """
 
     task_id: str
@@ -38,7 +38,6 @@ class TaskPacket:
     acceptance_criteria: list[str] = field(default_factory=list)
     dependencies: list[str] = field(default_factory=list)
     base_commit: str = ""
-    artifacts: list[str] = field(default_factory=list)
     project_path: str = ""
     verification_commands: list[str] = field(default_factory=list)
     output_contract: list[str] = field(default_factory=list)
@@ -54,7 +53,6 @@ class TaskPacket:
             acceptance_criteria=[str(x) for x in data.get("acceptance_criteria", [])],
             dependencies=[str(x) for x in data.get("dependencies", [])],
             base_commit=str(data.get("base_commit", "")),
-            artifacts=[str(x) for x in data.get("artifacts", [])],
             project_path=str(data.get("project_path", "")),
             verification_commands=[str(x) for x in data.get("verification_commands", [])],
             output_contract=[str(x) for x in data.get("output_contract", [])],

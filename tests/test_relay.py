@@ -62,17 +62,17 @@ def test_incident_parameters_read_as_alive_and_guard_abandon(tmp_path):
     attempt = _attempt(packet_path=str(packet), **stamps)
 
     facts = relay_facts(attempt)
-    assert facts["receiptExists"] is False
-    assert facts["elapsedSec"] == 840
-    assert facts["leaseRemainingSec"] == 6360
-    assert facts["leaseElapsedFraction"] == round(840 / 7200, 3)
+    assert facts["receipt_exists"] is False
+    assert facts["elapsed_sec"] == 840
+    assert facts["lease_remaining_sec"] == 6360
+    assert facts["lease_elapsed_fraction"] == round(840 / 7200, 3)
     assert facts["worktree"]["exists"] is False  # no worktree_path → no crash
     assert suggest_action(attempt, facts) == "wait"
 
     refusal = abandon_refusal(attempt, facts)
     assert refusal is not None
     assert refusal["state"] == "spawned"
-    assert refusal["suggestedAction"] == "wait"
+    assert refusal["suggested_action"] == "wait"
     assert "--force" in refusal["force"]
     assert "clean worktree" in refusal["advice"]
 
@@ -86,7 +86,7 @@ def test_guard_releases_when_lease_mostly_spent_or_expired():
     expired = _timestamps(timedelta(minutes=130), timedelta(hours=2))
     attempt = _attempt(**expired)
     facts = relay_facts(attempt)
-    assert facts["leaseRemainingSec"] <= 0
+    assert facts["lease_remaining_sec"] <= 0
     assert abandon_refusal(attempt, facts) is None
     assert suggest_action(attempt, facts) == "await-expiry"
 
@@ -115,7 +115,7 @@ def test_guard_releases_on_failure_evidence_or_terminal_states(tmp_path):
         state="abandoned", packet_path=str(packet), receipt_path=str(receipt), **stamps
     )
     facts = relay_facts(abandoned_late)
-    assert facts["receiptExists"] is True
+    assert facts["receipt_exists"] is True
     assert suggest_action(abandoned_late, facts) == "adopt"
 
 
@@ -126,7 +126,7 @@ def test_sealed_receipt_on_active_attempt_says_reconcile_not_abandon(tmp_path):
     attempt = _attempt(receipt_path=str(receipt), **stamps)
 
     facts = relay_facts(attempt)
-    assert facts["receiptExists"] is True
+    assert facts["receipt_exists"] is True
     assert suggest_action(attempt, facts) == "reconcile"
     refusal = abandon_refusal(attempt, facts)
     assert refusal is not None
@@ -141,7 +141,7 @@ def test_guard_fraction_boundary_is_inclusive_release():
     )  # exactly 80% spent
     attempt = _attempt(**stamps)
     facts = relay_facts(attempt)
-    assert facts["leaseElapsedFraction"] == 0.8
+    assert facts["lease_elapsed_fraction"] == 0.8
     assert abandon_refusal(attempt, facts) is None
     assert suggest_action(attempt, facts) == "wait-lease-nearly-spent"
 
@@ -149,6 +149,6 @@ def test_guard_fraction_boundary_is_inclusive_release():
 def test_unparseable_budget_never_blocks_the_hatch():
     attempt = _attempt(created_at="not-a-date", lease_expires_at="")
     facts = relay_facts(attempt)
-    assert facts["elapsedSec"] is None
-    assert facts["leaseRemainingSec"] is None
+    assert facts["elapsed_sec"] is None
+    assert facts["lease_remaining_sec"] is None
     assert abandon_refusal(attempt, facts) is None

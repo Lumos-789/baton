@@ -179,20 +179,24 @@ def test_status_verb_reports_fresh_run_snapshot(tmp_path, capsys):
     payload = json.loads(out.out)
     assert set(payload) == {
         "ok",
-        "runId",
+        "command",
+        "run_id",
         "feature",
-        "projectPath",
+        "project_path",
         "revision",
         "complete",
-        "missingRequiredTickets",
+        "missing_required_tickets",
+        "resolved_but_unchecked",
         "attempts",
     }
     assert payload["ok"] is True
-    assert payload["runId"] == "RUN-real-change"
+    assert payload["command"] == "status"
+    assert payload["run_id"] == "RUN-real-change"
     # 0 means "no plan revision recorded yet" — status must not create one.
     assert payload["revision"] == 0
     assert payload["complete"] is False
-    assert payload["missingRequiredTickets"] == ["1.1"]
+    assert payload["missing_required_tickets"] == ["1.1"]
+    assert payload["resolved_but_unchecked"] == []
     assert payload["attempts"] == []
 
 
@@ -256,7 +260,9 @@ def test_status_verb_shape_equals_controller_status(tmp_path, capsys):
     via_boundary = controller.status()
 
     assert code == 0
-    assert via_cli == json.loads(json.dumps(via_boundary, ensure_ascii=False))
+    assert via_cli["ok"] is True and via_cli["command"] == "status"
+    body = {key: value for key, value in via_cli.items() if key not in {"ok", "command"}}
+    assert body == json.loads(json.dumps(via_boundary, ensure_ascii=False))
 
 
 def test_cleanup_typoed_change_id_is_one_json_line(tmp_path, capsys):
@@ -298,8 +304,10 @@ def test_cleanup_dry_run_previews_without_removing(tmp_path, capsys):
     out = capsys.readouterr()
     assert code == 0
     payload = json.loads(out.out)
-    assert payload["dryRun"] is True
-    assert [w["branch"] for w in payload["wouldRemove"]] == [
+    assert payload["ok"] is True
+    assert payload["command"] == "cleanup"
+    assert payload["dry_run"] is True
+    assert [w["branch"] for w in payload["would_remove"]] == [
         "baton/real-change-tic-001-a01"
     ]
     assert wt.exists()  # preview removed nothing
@@ -312,7 +320,9 @@ def _commit_worktree(path: Path) -> None:
     )
 
 
-def test_cli_reconcile_tampered_receipt_exits_nonzero(tmp_path, capsys):
+def test_cli_reconcile_tampered_receipt_surfaces_a_recover(tmp_path, capsys):
+    """An edited receipt is rejected before the merge and comes back as a
+    ``recover`` that names the changed segment — not as a CLI error."""
     repo = _make_repo(tmp_path)
     _add_change(repo, "real-change")
 
@@ -355,10 +365,14 @@ def test_cli_reconcile_tampered_receipt_exits_nonzero(tmp_path, capsys):
     )
     out = capsys.readouterr()
     payload = json.loads(out.out)
-    assert code == 1
+    assert code == 0
+    assert payload["ok"] is True
     assert payload["command"] == "reconcile"
-    assert "receiptHash" in payload["error"]
-    assert "verification[0].exitCode" in payload["error"]
+    assert payload["state"] == "blocked"
+    recover = next(item for item in payload["actions"] if item["kind"] == "recover")
+    assert recover["reason"] == "receipt-invalid"
+    assert "receiptHash" in recover["detail"]
+    assert "verification[0].exitCode" in recover["detail"]
     assert out.err == ""
 
 
@@ -426,7 +440,7 @@ def test_cli_abandon_clears_stuck_attempt_and_retry_reuses_persisted_verify(
     abandoned = json.loads(capsys.readouterr().out)
     assert code == 0
     assert abandoned["state"] == "abandoned"
-    assert abandoned["ticketNum"] == 101
+    assert abandoned["ticket_num"] == 101
     assert "worktree" in abandoned["preserves"]
 
     # No --verify here: the run's persisted commands must be reused.
@@ -467,12 +481,17 @@ def test_cli_abandon_guard_refuses_live_attempt_one_json_line(tmp_path, capsys):
     out = capsys.readouterr()
     payload = json.loads(out.out)
     assert code == 1
+    assert payload["ok"] is False
     assert payload["command"] == "abandon"
+    assert payload["code"] == "abandon-refused"
     assert "abandon refused" in payload["error"]
-    refusal = json.loads(payload["error"].split("abandon refused — ", 1)[1])
-    assert refusal["assignmentId"] == action["assignment_id"]
-    assert refusal["suggestedAction"] == "wait"
-    assert refusal["leaseRemainingSec"] > 7000
+    # The judgment is a field of its own, not JSON inside the message.
+    refusal = payload["refusal"]
+    assert refusal["assignment_id"] == action["assignment_id"]
+    # No agent is bound yet, so the way forward is a fresh dispatch, not a wait.
+    assert refusal["suggested_action"] == "dispatch"
+    assert refusal["agent_id"] == ""
+    assert refusal["lease_remaining_sec"] > 7000
     assert out.err == ""
 
     code = session_control.main(

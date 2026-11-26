@@ -77,10 +77,10 @@ def main() -> int:
 
         status = _run(str(project), "demo", "status")
         snapshot = json.loads(status.stdout)
-        if status.returncode != 0 or snapshot.get("runId") != "RUN-demo":
+        if status.returncode != 0 or snapshot.get("run_id") != "RUN-demo":
             print(f"CLI SMOKE FAIL: unexpected status: {snapshot}")
             return 1
-        if snapshot.get("missingRequiredTickets") != ["1.1"]:
+        if snapshot.get("missing_required_tickets") != ["1.1"]:
             print(f"CLI SMOKE FAIL: unexpected missing tickets: {snapshot}")
             return 1
 

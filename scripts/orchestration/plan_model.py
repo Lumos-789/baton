@@ -31,7 +31,10 @@ def stable_hash(data: Any) -> str:
 
 @dataclass
 class PlanTicket:
-    """Machine-readable snapshot of one OpenSpec task in a plan revision."""
+    """Machine-readable snapshot of one OpenSpec task in a plan revision.
+
+    Every ticket is required: completion means each one is resolved.
+    """
 
     num: int
     title: str
@@ -39,8 +42,6 @@ class PlanTicket:
     blocked_by: list[int] = field(default_factory=list)
     status: str = "ready"
     criteria: list[str] = field(default_factory=list)
-    required: bool = True
-    source_revision: int = 1
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PlanTicket":
@@ -51,8 +52,6 @@ class PlanTicket:
             blocked_by=[int(x) for x in data.get("blocked_by", [])],
             status=str(data.get("status", "ready")),
             criteria=[str(x) for x in data.get("criteria", [])],
-            required=bool(data.get("required", True)),
-            source_revision=int(data.get("source_revision", 1)),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -72,7 +71,6 @@ class PlanRevision:
     approved_at: str
     created_at: str
     tickets: list[PlanTicket] = field(default_factory=list)
-    completion_state: str = "active"
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PlanRevision":
@@ -90,22 +88,10 @@ class PlanRevision:
             approved_at=str(data.get("approved_at", "")),
             created_at=str(data.get("created_at", "")),
             tickets=[PlanTicket.from_dict(x) for x in data.get("tickets", [])],
-            completion_state=str(data.get("completion_state", "active")),
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "job_id": self.job_id,
-            "feature": self.feature,
-            "revision": self.revision,
-            "parent_revision": self.parent_revision,
-            "plan_hash": self.plan_hash,
-            "approved_by": self.approved_by,
-            "approved_at": self.approved_at,
-            "created_at": self.created_at,
-            "tickets": [t.to_dict() for t in self.tickets],
-            "completion_state": self.completion_state,
-        }
+        return asdict(self)
 
     def hashable_dict(self) -> dict[str, Any]:
         data = self.to_dict()

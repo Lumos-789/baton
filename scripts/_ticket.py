@@ -8,11 +8,14 @@ The plan face is an OpenSpec change: ``openspec/changes/<change-id>/`` with
 
 Mapping rules (authoritative source: docs/ticket-format.md):
 
-- ``## N. Section title`` starts section N.
+- ``## N. Section title`` starts section N; the next top-level heading (``#``
+  or ``##``) that is not a numbered section ends it.
 - ``- [ ] N.M text`` / ``- [x] N.M text`` is task N.M (bullet ``-``/``*``/``+``,
   checkbox ``[ ]``/``[x]``/``[X]`` all tolerated).
 - A checkbox with a task id but no text (``- [ ] 1.2``) is a validation error
-  naming the line — never a silently dropped ticket.
+  naming the line — never a silently dropped ticket. So are a top-level
+  checkbox without an id and an indented checkbox that carries one: both used
+  to vanish.
 - Lines inside a fenced code block (````` ``` `````) are not tasks; example
   checkboxes in docs stay examples.
 - Ticket num = ``N * 100 + M`` (1.2 → 102, 3.4 → 304); reversible for display.
@@ -35,11 +38,14 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-VALID_STATUSES = {"ready", "resolved"}
-
 _SECTION_RE = re.compile(r"^##\s+(\d+)\s*[.\u3002]?\s*(.*?)\s*$")
+#: Any other level-1 or level-2 heading: it closes the numbered section, so
+#: checkboxes under it are not tickets (deeper headings belong to the section).
+_TOP_HEADING_RE = re.compile(r"^#{1,2}(?!#)\s")
 _TASK_RE = re.compile(r"^[-*+]\s*\[\s*([ xX])\s*\]\s+(\d+)\.(\d+)\s+(.+?)\s*$")
 _TASK_NO_TEXT_RE = re.compile(r"^[-*+]\s*\[\s*[ xX]\s*\]\s+\d+\.\d+\s*$")
+_CHECKBOX_RE = re.compile(r"^[-*+]\s*\[\s*[ xX]\s*\]")
+_INDENTED_TASK_RE = re.compile(r"^\s+[-*+]\s*\[\s*[ xX]\s*\]\s+(\d+\.\d+)\s+\S")
 _FENCE_RE = re.compile(r"^\s*```")
 _CHANGE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -110,7 +116,8 @@ def parse_tasks_md(path: str | Path) -> list[Ticket]:
 
     Raises:
         TasksMarkdownError: file missing, no sections/tasks, duplicate or
-            misfiled task ids, a task id with no description text.
+            misfiled task ids, a task id with no text, a top-level checkbox
+            without an id, an indented checkbox that carries one.
     """
     path = Path(path)
     if not path.is_file():
@@ -118,7 +125,9 @@ def parse_tasks_md(path: str | Path) -> list[Ticket]:
             f"OpenSpec tasks.md not found: {path} — a change needs "
             f"openspec/changes/<id>/proposal.md + tasks.md before baton can run it"
         )
-    text = path.read_text(encoding="utf-8")
+    # ``utf-8-sig`` drops a byte-order mark, which would otherwise hide the
+    # first ``## 1.`` header and silently take section 1's tickets with it.
+    text = path.read_text(encoding="utf-8-sig")
 
     section_titles: dict[int, str] = {}  # section no → title (file order kept below)
     section_order: list[int] = []
@@ -139,6 +148,9 @@ def parse_tasks_md(path: str | Path) -> list[Ticket]:
             if current_section not in section_titles:
                 section_order.append(current_section)
                 section_titles[current_section] = section_match.group(2)
+            continue
+        if _TOP_HEADING_RE.match(raw):
+            current_section = None
             continue
         if current_section is None:
             continue
@@ -163,6 +175,23 @@ def parse_tasks_md(path: str | Path) -> list[Ticket]:
                 raise TasksMarkdownError(f"duplicate task id {sec}.{item} in {path}")
             seen_nums.add(num)
             parsed.append((sec, item, done, task_match.group(4)))
+            continue
+        # Neither shape below is a ticket, and neither may be dropped without
+        # a word: an unnumbered top-level checkbox reads as work to do, and an
+        # indented N.M line looks exactly like a task that never ran.
+        if _CHECKBOX_RE.match(raw):
+            raise TasksMarkdownError(
+                f"checkbox on line {lineno} of {path} has no task id: "
+                f"{raw.strip()!r} — every top-level checkbox in a section is a "
+                "ticket and needs an N.M id (indent it to make it a sub-step)"
+            )
+        indented = _INDENTED_TASK_RE.match(raw)
+        if indented:
+            raise TasksMarkdownError(
+                f"task {indented.group(1)} on line {lineno} of {path} is indented: "
+                f"{raw.strip()!r} — tasks must start at column 0 "
+                "(drop the id to make it a sub-step)"
+            )
 
     if not section_order:
         raise TasksMarkdownError(f"no `## N.` sections found in {path}")
@@ -236,8 +265,9 @@ def uncheck_task(path: str | Path, num: int) -> None:
     The exact mirror of :func:`check_task`: same checkbox tolerance
     (``[x]``/``[X]``/``[ x ]``), same byte-preserving atomic ``tmp`` + rename
     write and the same ``newline=""`` read so a CRLF checkout keeps its line
-    endings. ``ticket_board uncheck`` is the documented ``reverse`` of baton's
-    own ``[x]`` write-back, so it must not turn one flip into a whole-file diff.
+    endings. ``ticket_board uncheck`` reports itself as the ``reverse`` of a
+    ``ticket_board check``; re-running a ticket baton already delivered goes
+    through ``reopen``, which calls this on its own.
 
     Raises:
         TasksMarkdownError: file missing or the task is not currently checked.
@@ -266,7 +296,6 @@ def uncheck_task(path: str | Path, num: int) -> None:
 __all__ = [
     "TasksMarkdownError",
     "Ticket",
-    "VALID_STATUSES",
     "check_task",
     "parse_tasks_md",
     "task_num",

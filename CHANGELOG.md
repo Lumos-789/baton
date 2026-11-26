@@ -1,5 +1,160 @@
 # Changelog
 
+## 0.5.0 (2026-11-27)
+
+Correctness round from the 11-26 full review. Every item below was reproduced
+against a real git repository before it was fixed, and each fix carries a
+regression test. A `queue.db` written by 0.4.x is migrated on first connect.
+
+**CLI breaking changes**
+
+- **One envelope.** Every verb prints `{"ok": true, "command": "<verb>", ...}`
+  on success, all keys snake_case (`run_id`, `missing_required_tickets`,
+  `relay.elapsed_sec` / `lease_remaining_sec` / `receipt_exists` /
+  `suggested_action`, `cleanup.dry_run` / `would_remove` /
+  `integration_included`, `abandon.ticket_num`, `adopt.adopted_from` /
+  `follow_up`). A domain failure is `{"ok": false, "command", "code", "error"}`
+  with a stable `code` (`verification-unconfigured`, `tasks-md-invalid`,
+  `abandon-refused`, `unknown-assignment`, `schema-too-new`, ...) and its data
+  as fields (`refusal`) — no longer JSON inside the error string.
+- **A rejected receipt is a `recover`, not a CLI error.** `reconcile` returns
+  the batch with reason `receipt-invalid` and the changed segment in `detail`,
+  so one bad receipt no longer hides the rest of the batch.
+- **Removed:** the ignored `final_text` argument (replaced by
+  `reconcile --reason`, which is recorded for diagnosis), the never-populated
+  `TaskPacket.artifacts`, `PlanTicket.required` / `source_revision` and
+  `PlanRevision.completion_state`, the never-written states `running` /
+  `submitted` / `failed` / `canceled` / `verifying`, and the dead
+  `release_lease` parameter. **Packet format change:** `task_packet_hash` no
+  longer covers `artifacts` — finish in-flight assignments before upgrading;
+  sealed receipts from earlier versions still verify and reconcile.
+- **`cleanup` deletes branches.** It removes every assignment branch whose
+  commits are in the integration branch and, with `--include-integration`, the
+  integration branch once it is merged into the base branch; unmerged branches
+  are kept and reported (`branches_kept`). A change the plan store remembers
+  keeps the empty-but-successful answer once nothing is left.
+
+**The core promise now holds for the merged tree**
+
+- **Every merge is verified.** The controller re-runs the verification commands
+  on the integration branch after each merge — fresh, or already landed after
+  a conflict resolution — inside the integration lock. A red result parks the
+  attempt (`post-merge-verification-failed`), returns a `repair_integration`
+  action with the failing output, holds every other receipt, and blocks new
+  claims until a fix lands. Before, two branches that were green alone could
+  produce a broken integration branch and the run still said `complete`.
+- **A changed task text parks its in-flight attempt** (`ticket-redefined` /
+  `ticket-removed`) with both texts shown, instead of integrating the old
+  wording and checking it off against the new definition. Restoring the text
+  resumes the attempt; `abandon` re-claims under the new one.
+
+**Liveness and retries**
+
+- **Leases are 7200 s of silence.** The heartbeat, edited files and new
+  commits renew a lease (at most three leases from the claim); before, an
+  attempt died at the two-hour mark whatever it was doing.
+- **Automatic retries are bounded** at 3 attempts per ticket. Each retry is
+  announced in the new batch `warnings` (`lease-expired-retried`, with the
+  stale attempt's `agent_id` so the session can stop a subagent that is still
+  running); before, the loop was endless and left no trace.
+- **`adopt` covers superseded attempts too,** not only abandoned ones: a slow
+  subagent that finished after its lease expired no longer loses its verified
+  work.
+- **An unbound claim is re-dispatched to any session,** so handing over a run
+  does not wait out a two-hour lease for a claim no agent was ever bound to.
+
+**Honest state**
+
+- **`reopen <N.M>` re-runs a finished ticket:** it voids the ticket's succeeded
+  receipts and restarts its retry budget. A manual un-check no longer does
+  nothing silently — it is reported (`resolved_but_unchecked` in `status`, a
+  `resolved-but-unchecked` warning on every batch) and still not honored
+  without `reopen`.
+- **Failure reasons survive.** `reconcile --reason` records the operator's
+  account, and a failed verification keeps its exit code and output tail in
+  `verification.json`; a `recover` action carries both, plus the agent id,
+  the worktree, the retry budget and ready next steps.
+- **A stale `unknown` attempt retires itself** once its ticket is delivered by
+  another attempt or by hand.
+
+**Environment and hygiene**
+
+- **Verification commands inherit the caller's environment.** They used to run
+  under a login shell, where macOS `path_helper` rebuilds `PATH` — `python3`
+  resolved to the system interpreter instead of the one the user and the
+  subagents use.
+- **A hanging verification command is killed** together with its whole process
+  group after the 30-minute limit and reported as a `ReceiptError`, not a raw
+  `TimeoutExpired` traceback.
+- **Capacity and base branch are remembered by the run,** like `--verify`
+  already was: a `reconcile` that omitted `--capacity` used to narrow a
+  parallel run to serial, one completion at a time.
+- **`.dsh/baton/` is kept out of the target repository** through
+  `info/exclude`; it used to show up untracked, ready to be staged by a
+  blanket `git add -A`. The `[x]` write-back is reported as what it is — an
+  uncommitted edit to commit with the merge.
+- **A re-run starts from a current base:** an integration branch whose work is
+  already merged is fast-forwarded to the base branch; one that still holds
+  unmerged work is reported, never moved.
+- **The packet's `baseSha` is read after the receipt pass,** so a ticket
+  claimed in the same call that landed another one no longer records a stale
+  base (and a `changed_files` list that includes the previous ticket's files).
+- **A top-level checkbox without an id is an error,** as is an indented
+  checkbox that carries one; both used to vanish without a word.
+- **The dispatch prompt asks for `seal` only** (it re-runs the verification
+  itself; the old flow ran the suite twice) and points the subagent at the
+  whole change — `design.md` and the spec deltas under `specs/` included.
+- **`queue.db` has a schema version:** a store written by a newer baton fails
+  loud instead of crashing on a missing column.
+
+**Structure**
+
+- `SessionController` is assembled from focused mixins (`receipt_flow`,
+  `lease_flow`, `dispatch_flow`, `operator_flow`, `run_settings`) so the
+  scheduling loop reads on its own; the attempt-state vocabulary lives in one
+  place and the schema's active-state index is generated from it; every git
+  call goes through `git_run.py`.
+
+**After an independent audit of this release candidate** (each finding was
+reproduced, fixed and pinned by a regression test):
+
+- `reconcile` and `adopt` no longer integrate a receipt directly: the receipt
+  pass inside `actions` does it after the red-base check. A completion notice
+  used to merge its receipt onto a red integration branch.
+- One `actions()` call judges each lease once. A lease that ran out between
+  the sweep and the claim used to be re-issued *and* replaced in the same
+  batch — two subagents on one ticket.
+- A verification that cannot run on the merged tree (timeout, a command that
+  cannot start) parks the attempt as the owner of the merge instead of
+  reporting "nothing was merged". The recorded outcome is keyed by the commit
+  and the verification commands, so corrected commands re-verify, and passing
+  `--verify` again forces a re-run.
+- A ticket locked out by the retry budget stays visible
+  (`blocked: retry-budget-spent`); before it silently left the run incomplete.
+  `abandon` reports `attempts_used` / `attempts_max` and says when `reopen` is
+  the only way forward.
+- The red-base hold stays when the parked owner's receipt is rejected, and the
+  ownerless red base is named in the same batch.
+- The project must be the root of its own repository: a directory inside
+  another repository is refused instead of silently creating `baton/*`
+  branches there. The `.dsh/baton/` exclusion is repository-relative and
+  verified with git.
+- A failed fast-forward of the integration branch is reported
+  (`integration-sync-failed`) instead of silently building on the stale tip.
+- The schema-version gate runs before any DDL touches the store.
+- A resumed attempt can earn lease extensions again (its hard cap restarts
+  with it); a receipt another process already finalized is not an error.
+- `status` suggests `repair-integration` / `resolve-or-abandon` for parked
+  attempts (the receipt-on-disk check used to shadow both).
+- Parser: a top-level heading that is not a numbered section ends the section
+  (checkboxes under it are not tickets); a UTF-8 byte-order mark no longer
+  hides the first section.
+- `bind` with an empty agent id is a usage error, not a traceback. `complete`
+  keeps the worktree of an attempt still in flight, and a re-issued dispatch
+  recreates a worktree that a mid-run cleanup removed.
+
+Regression: 213 → 294 tests pass; `./tests/regression.sh` 5/5 stages green.
+
 ## 0.4.5 (2026-11-23)
 
 Docs-only host-portability round from the 11-23 review; no code change.

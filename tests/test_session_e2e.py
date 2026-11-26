@@ -110,7 +110,7 @@ def test_parallel_pair_then_final_completes_without_lost_task(tmp_path):
     assert attempts[202].state == "succeeded"
     assert attempts[301].state == "succeeded"
     assert {e.ticket_num for e in controller.store.result_envelopes()} >= {201, 202, 301}
-    assert controller.store.latest_completion()["missingRequiredTickets"] == []
+    assert controller.store.latest_completion()["missing_required_tickets"] == []
     assert [a.kind for a in after_final.actions] == ["complete"]
     # tasks.md write-back: every task checked.
     statuses = {t.num: t.status for t in parse_tasks_md(

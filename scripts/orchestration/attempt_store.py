@@ -1,10 +1,11 @@
-"""Execution-attempt lifecycle: claim, lease, bind, state, finalize.
+"""Execution-attempt lifecycle: claim, lease, bind, state, finalize, reopen.
 
 Mixed into :class:`orchestration.plan_store.PlanStore` so the store's
-persistence and plan-revision logic stays readable. These methods use the
-private helpers the base class provides (``_connect``, ``_event_locked``,
-``_ensure_initial_plan_locked``, ``_write_plan_json``, ...); this module never
-imports ``plan_store``, so the dependency stays one-way.
+persistence and plan-revision logic stays readable; lease renewal and the
+retry budget live in :class:`orchestration.budget_store.BudgetStoreMixin`.
+These methods use the private helpers the base class provides (``_connect``, ``_event_locked``,
+``_ensure_initial_plan_locked``, ``_run_setting_locked``, ...); this module
+never imports ``plan_store``, so the dependency stays one-way.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import hashlib
 import json
 import sqlite3
 import uuid
+from typing import Any
 
 from _frontier import is_frontier_ticket
 from _ticket import TasksMarkdownError, check_task
@@ -21,6 +23,9 @@ from orchestration.plan_model import stable_hash, utc_now
 from orchestration.result import ResultEnvelope
 from orchestration.session_model import ExecutionAttempt
 from orchestration.store_base import (
+    ACTIVE_ATTEMPT_STATES,
+    LEASED_ATTEMPT_STATES,
+    MAX_ATTEMPTS_PER_TICKET,
     TERMINAL_ATTEMPT_STATES,
     ExecutionAttemptError,
     PlanStoreError,
@@ -39,13 +44,20 @@ class AttemptStoreMixin:
         base_branch: str = "main",
         base_sha: str = "",
         lease_seconds: int = 7200,
+        expire_first: bool = True,
     ) -> list[ExecutionAttempt]:
         """Atomically claim up to ``capacity`` distinct ready tickets.
 
         This is the session-subagent claim primitive. It never claims the whole
-        frontier pre-emptively. Each
-        returned attempt receives a one-time claim token; only its hash is
-        persisted.
+        frontier pre-emptively. Each returned attempt receives a one-time
+        claim token; only its hash is persisted. A ticket that already spent
+        its automatic retry budget (``MAX_ATTEMPTS_PER_TICKET``) is left for
+        the operator instead of being dispatched again.
+
+        ``expire_first=False`` is for a caller that has already swept expired
+        leases earlier in the same turn (the controller does): judging the
+        lease a second time here could retire an attempt the caller just
+        re-dispatched, putting two subagents on one ticket.
         """
         if not session_id.strip():
             raise ValueError("session_id is required")
@@ -57,12 +69,12 @@ class AttemptStoreMixin:
         try:
             conn.execute("BEGIN IMMEDIATE")
             plan = self._ensure_initial_plan_locked(conn)
-            self._expire_execution_attempts_locked(conn)
-            active_states = ("leased", "spawned", "running", "submitted", "verifying", "integrating", "blocked-review")
+            if expire_first:
+                self._expire_execution_attempts_locked(conn)
             active_rows = conn.execute(
                 "SELECT ticket_num FROM execution_attempts "
-                "WHERE job_id = ? AND state IN (?, ?, ?, ?, ?, ?, ?)",
-                (self.job_id, *active_states),
+                f"WHERE job_id = ? AND state IN ({self._active_states_sql()})",
+                (self.job_id, *sorted(ACTIVE_ATTEMPT_STATES)),
             ).fetchall()
             active_tickets = {int(row["ticket_num"]) for row in active_rows}
             available = max(0, capacity - len(active_rows))
@@ -70,6 +82,7 @@ class AttemptStoreMixin:
                 conn.commit()
                 return []
 
+            epochs = self._attempt_epochs_locked(conn)
             ticket_files = {
                 ticket.num: ticket for ticket in self._read_source_tickets()
             }
@@ -86,25 +99,21 @@ class AttemptStoreMixin:
             eligible = [
                 ticket
                 for ticket in plan.tickets
-                if ticket.required
-                and ticket.num not in active_tickets
+                if ticket.num not in active_tickets
                 and ticket.num not in resolved
                 and ticket_files.get(ticket.num) is not None
                 and is_frontier_ticket(
                     ticket_files[ticket.num].status, ticket.blocked_by, resolved
                 )
+                and self._attempts_used_locked(conn, ticket.num, epochs)
+                < MAX_ATTEMPTS_PER_TICKET
             ]
             eligible.sort(key=lambda ticket: ticket.num)
 
             for ticket in eligible:
                 if len(claimed) >= available:
                     break
-                row = conn.execute(
-                    "SELECT COALESCE(MAX(attempt), 0) AS n FROM execution_attempts "
-                    "WHERE job_id = ? AND ticket_num = ?",
-                    (self.job_id, ticket.num),
-                ).fetchone()
-                attempt_no = int(row["n"]) + 1
+                attempt_no = self._latest_attempt_locked(conn, ticket.num) + 1
                 assignment_id = (
                     f"ASG-{self.feature}-{ticket.num:03d}-r{plan.revision}-a{attempt_no}"
                 )
@@ -197,7 +206,9 @@ class AttemptStoreMixin:
                 (self.job_id, assignment_id),
             ).fetchone()
             if row is None:
-                raise ExecutionAttemptError(f"unknown assignment: {assignment_id}")
+                raise ExecutionAttemptError(
+                    f"unknown assignment: {assignment_id}", code="unknown-assignment"
+                )
             return self._execution_attempt_from_row(row)
         finally:
             conn.close()
@@ -303,10 +314,13 @@ class AttemptStoreMixin:
         state: str,
         *,
         failure_code: str = "",
-        release_lease: bool = False,
     ) -> ExecutionAttempt:
-        """Move an attempt to a controller-owned lifecycle state."""
-        allowed = {"running", "submitted", "verifying", "integrating", "blocked-review", "unknown"}
+        """Move an attempt to a controller-owned lifecycle state.
+
+        ``failure_code`` is a short machine prefix optionally followed by
+        ``: <detail>``; the recover action shows it verbatim.
+        """
+        allowed = {"leased", "spawned", "integrating", "blocked-review", "unknown"}
         if state not in allowed:
             raise ValueError(f"unsupported execution attempt state: {state}")
         conn = self._connect()
@@ -325,11 +339,7 @@ class AttemptStoreMixin:
             self._event_locked(
                 conn,
                 f"execution.attempt.{state}",
-                {
-                    "assignmentId": assignment_id,
-                    "failureCode": failure_code,
-                    "leaseReleased": release_lease,
-                },
+                {"assignmentId": assignment_id, "failureCode": failure_code},
             )
             conn.commit()
         finally:
@@ -341,8 +351,8 @@ class AttemptStoreMixin:
 
         Called by the controller before planning a batch so an expired lease is
         never re-dispatched as if it were still owned. ``failure_code`` is set
-        to ``lease-expired``; the attempt can then be retried (superseded once
-        a successor exists) or abandoned by the operator.
+        to ``lease-expired``; the attempt is retried automatically while the
+        ticket still has retry budget, otherwise the operator decides.
         """
         conn = self._connect()
         try:
@@ -382,7 +392,7 @@ class AttemptStoreMixin:
         the ticket becomes claimable again. It deliberately does **not** remove
         the assignment worktree/branch, its commits, packet or receipt — those
         stay on disk for audit. It only destroys the attempt's ability to be
-        reconciled: any later receipt is ignored.
+        reconciled: any later receipt is ignored unless ``adopt`` revives it.
         """
         return self._resolve_execution_attempt(
             assignment_id, state="abandoned", failure_code=reason
@@ -394,28 +404,28 @@ class AttemptStoreMixin:
         *,
         lease_seconds: int = 7200,
     ) -> ExecutionAttempt:
-        """Revive an abandoned attempt so a late sealed receipt can reconcile.
+        """Revive an abandoned or superseded attempt so a late receipt lands.
 
-        The reverse hatch of :meth:`abandon_execution_attempt`: an abandoned
-        attempt whose subagent later sealed a valid receipt is put back into an
-        active state (``verifying``) with a fresh lease, so the controller can
-        verify and integrate the receipt as if the abandon never happened. The
-        caller is expected to hold the verified receipt; this transition only
-        changes scheduling state, never git.
+        The reverse hatch of :meth:`abandon_execution_attempt`: an attempt
+        whose subagent later sealed a valid receipt is put back into an active
+        state with a fresh lease, so the controller can verify and integrate
+        the receipt as if the retire never happened. The caller is expected to
+        hold the verified receipt; this transition only changes scheduling
+        state, never git.
         """
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
             row = self._load_execution_attempt_locked(conn, assignment_id)
-            if row["state"] != "abandoned":
+            if row["state"] != "abandoned" and row["state"] != "superseded":
                 raise ExecutionAttemptError(
                     f"cannot adopt {assignment_id} while it is {row['state']} "
-                    "(only abandoned attempts can be adopted)"
+                    "(only abandoned or superseded attempts can be adopted)"
                 )
             now = utc_now()
             expires_at = _utc_after(lease_seconds)
             conn.execute(
-                "UPDATE execution_attempts SET state = 'verifying', "
+                "UPDATE execution_attempts SET state = 'integrating', "
                 "failure_code = '', lease_expires_at = ?, updated_at = ? "
                 "WHERE job_id = ? AND assignment_id = ?",
                 (expires_at, now, self.job_id, assignment_id),
@@ -454,11 +464,7 @@ class AttemptStoreMixin:
             self._event_locked(
                 conn,
                 f"execution.attempt.{state}",
-                {
-                    "assignmentId": assignment_id,
-                    "failureCode": failure_code,
-                    "leaseReleased": True,
-                },
+                {"assignmentId": assignment_id, "failureCode": failure_code},
             )
             conn.commit()
         finally:
@@ -550,9 +556,8 @@ class AttemptStoreMixin:
         now = utc_now()
         rows = conn.execute(
             "SELECT assignment_id FROM execution_attempts "
-            "WHERE job_id = ? AND lease_expires_at <= ? "
-            "AND state IN ('leased', 'spawned', 'running', 'submitted', 'verifying', 'integrating')",
-            (self.job_id, now),
+            f"WHERE job_id = ? AND lease_expires_at <= ? AND state IN ({self._leased_states_sql()})",
+            (self.job_id, now, *sorted(LEASED_ATTEMPT_STATES)),
         ).fetchall()
         for row in rows:
             assignment_id = str(row["assignment_id"])
@@ -575,8 +580,18 @@ class AttemptStoreMixin:
             (self.job_id, assignment_id),
         ).fetchone()
         if row is None:
-            raise ExecutionAttemptError(f"unknown assignment: {assignment_id}")
+            raise ExecutionAttemptError(
+                f"unknown assignment: {assignment_id}", code="unknown-assignment"
+            )
         return row
+
+    @staticmethod
+    def _active_states_sql() -> str:
+        return ", ".join("?" for _ in ACTIVE_ATTEMPT_STATES)
+
+    @staticmethod
+    def _leased_states_sql() -> str:
+        return ", ".join("?" for _ in LEASED_ATTEMPT_STATES)
 
     @staticmethod
     def _claim_token_hash(claim_token: str) -> str:
@@ -585,7 +600,8 @@ class AttemptStoreMixin:
     def _require_claim_token(self, row: sqlite3.Row, claim_token: str) -> None:
         if self._claim_token_hash(claim_token) != row["claim_token_hash"]:
             raise ExecutionAttemptError(
-                f"invalid claim token for assignment {row['assignment_id']}"
+                f"invalid claim token for assignment {row['assignment_id']}",
+                code="invalid-claim-token",
             )
 
     def _execution_attempt_from_row(self, row: sqlite3.Row) -> ExecutionAttempt:
@@ -615,5 +631,6 @@ class AttemptStoreMixin:
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
         )
+
 
 __all__ = ["AttemptStoreMixin"]

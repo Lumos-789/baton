@@ -10,20 +10,21 @@ from typing import Any
 from _ticket import TasksMarkdownError, Ticket, parse_tasks_md, validate_change_id
 
 from orchestration.attempt_store import AttemptStoreMixin
+from orchestration.budget_store import BudgetStoreMixin
 from orchestration.plan_model import PlanRevision, PlanTicket, stable_hash, utc_now
 from orchestration.result import ResultEnvelope
 from orchestration.store_base import (
     VERIFICATION_COMMANDS_SETTING,
     ExecutionAttemptError,
     PlanStoreError,
-    TERMINAL_ATTEMPT_STATES,
     _atomic_write,
     _pretty_json,
 )
 from orchestration.store_schema import init_db
+from orchestration.worktree import exclude_runtime_dir
 
 
-class PlanStore(AttemptStoreMixin):
+class PlanStore(BudgetStoreMixin, AttemptStoreMixin):
     """Persist plan revisions, execution attempts, and audit events.
 
     The plan face is an OpenSpec change: ``openspec/changes/<feature>/tasks.md``
@@ -38,7 +39,7 @@ class PlanStore(AttemptStoreMixin):
         try:
             self.feature = validate_change_id(feature)
         except ValueError as exc:
-            raise PlanStoreError(str(exc)) from exc
+            raise PlanStoreError(str(exc), code="invalid-change-id") from exc
         self.job_id = self.feature
         self.baton_dir = self.project_path / ".dsh" / "baton"
         self.feature_dir = self.baton_dir / self.feature
@@ -74,6 +75,99 @@ class PlanStore(AttemptStoreMixin):
         finally:
             conn.close()
 
+    def plan_revision(self, revision: int) -> PlanRevision | None:
+        """Load one stored revision — the plan an in-flight attempt was claimed
+        against. ``None`` when no such revision exists."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT snapshot_json FROM plan_revisions "
+                "WHERE job_id = ? AND revision = ?",
+                (self.job_id, revision),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        return self._plan_from_snapshot_json(row["snapshot_json"])
+
+    def run_setting(self, key: str, default: Any = None) -> Any:
+        """Return a value persisted for this run, or ``default``.
+
+        Run settings are declared once and reused by every later call that
+        omits the flag (verification commands, capacity, base branch).
+        """
+        self.ensure_initial_plan()
+        conn = self._connect()
+        try:
+            return self._run_setting_locked(conn, key, default)
+        finally:
+            conn.close()
+
+    def run_settings(self, keys: list[str]) -> dict[str, Any]:
+        """Several run settings in one read; absent keys are left out."""
+        self.ensure_initial_plan()
+        conn = self._connect()
+        try:
+            return {
+                key: value
+                for key in keys
+                if (value := self._run_setting_locked(conn, key)) is not None
+            }
+        finally:
+            conn.close()
+
+    def peek_run_setting(self, key: str, default: Any = None) -> Any:
+        """Read a run setting without creating anything (for verbs that must
+        stay side-effect free on a change that never ran)."""
+        if not self.db_path.is_file():
+            return default
+        conn = self._read_only_connect()
+        try:
+            return self._run_setting_locked(conn, key, default)
+        finally:
+            conn.close()
+
+    def set_run_setting(self, key: str, value: Any) -> None:
+        """Persist a run-wide setting (an explicit re-declaration wins)."""
+        self.ensure_initial_plan()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._set_run_setting_locked(conn, key, value)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _run_setting_locked(
+        self, conn: sqlite3.Connection, key: str, default: Any = None
+    ) -> Any:
+        row = conn.execute(
+            "SELECT value_json FROM run_settings "
+            "WHERE job_id = ? AND setting_key = ?",
+            (self.job_id, key),
+        ).fetchone()
+        if row is None:
+            return default
+        try:
+            return json.loads(row["value_json"])
+        except json.JSONDecodeError as exc:
+            raise PlanStoreError(
+                f"run settings {key} are corrupt: {exc}", code="corrupt-run-setting"
+            ) from exc
+
+    def _set_run_setting_locked(
+        self, conn: sqlite3.Connection, key: str, value: Any
+    ) -> None:
+        payload = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        conn.execute(
+            "INSERT INTO run_settings (job_id, setting_key, value_json, updated_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT(job_id, setting_key) DO UPDATE SET "
+            "value_json = excluded.value_json, updated_at = excluded.updated_at",
+            (self.job_id, key, payload, utc_now()),
+        )
+        self._event_locked(conn, f"run.settings.{key}", {"value": value})
+
     def run_verification_commands(self) -> list[str]:
         """Return the verification commands persisted for this run, if any.
 
@@ -81,57 +175,13 @@ class PlanStore(AttemptStoreMixin):
         packet for the run reuses them even when the CLI call that follows does
         not repeat ``--verify``.
         """
-        self.ensure_initial_plan()
-        conn = self._connect()
-        try:
-            row = conn.execute(
-                "SELECT value_json FROM run_settings "
-                "WHERE job_id = ? AND setting_key = ?",
-                (self.job_id, VERIFICATION_COMMANDS_SETTING),
-            ).fetchone()
-        finally:
-            conn.close()
-        if row is None:
-            return []
-        try:
-            value = json.loads(row["value_json"])
-        except (TypeError, json.JSONDecodeError) as exc:
-            raise PlanStoreError(
-                f"run settings {VERIFICATION_COMMANDS_SETTING} are corrupt: {exc}"
-            ) from exc
+        value = self.run_setting(VERIFICATION_COMMANDS_SETTING, [])
         if not isinstance(value, list):
             raise PlanStoreError(
                 f"run settings {VERIFICATION_COMMANDS_SETTING} must be a list, "
                 f"got {type(value).__name__}"
             )
         return [str(item) for item in value]
-
-    def set_run_verification_commands(self, commands: list[str]) -> None:
-        """Persist the run-wide verification commands (explicit override wins)."""
-        normalized = [str(command) for command in commands]
-        if not normalized:
-            raise PlanStoreError("verification commands must not be empty")
-        self.ensure_initial_plan()
-        now = utc_now()
-        payload = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
-                "INSERT INTO run_settings (job_id, setting_key, value_json, updated_at) "
-                "VALUES (?, ?, ?, ?) ON CONFLICT(job_id, setting_key) DO UPDATE SET "
-                "value_json = excluded.value_json, updated_at = excluded.updated_at",
-                (self.job_id, VERIFICATION_COMMANDS_SETTING, payload, now),
-            )
-            self._event_locked(
-                conn,
-                "run.settings.verification-commands",
-                {"commands": normalized},
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
 
     def result_envelopes(self) -> list[ResultEnvelope]:
         """Return persisted Result Envelopes for the current job."""
@@ -151,30 +201,74 @@ class PlanStore(AttemptStoreMixin):
             conn.close()
 
     def latest_completion(self) -> dict[str, Any]:
-        """Check completion against the latest approved revision's required tickets."""
+        """Check completion against the latest approved revision's tickets."""
         plan = self.current_plan()
-        required = {t.num for t in plan.tickets if t.required}
         status_by_num = {t.num: t.status for t in self._read_source_tickets()}
         conn = self._connect()
         try:
-            rows = conn.execute(
-                "SELECT ticket_num FROM result_envelopes "
-                "WHERE job_id = ? AND status = 'succeeded'",
-                (self.job_id,),
-            ).fetchall()
-            for row in rows:
-                status_by_num[int(row["ticket_num"])] = "resolved"
+            status_by_num.update(self._receipt_resolved_locked(conn))
         finally:
             conn.close()
         missing = sorted(
-            n for n in required if status_by_num.get(n) != "resolved"
+            n for n in {t.num for t in plan.tickets} if status_by_num.get(n) != "resolved"
         )
         return {
             "jobId": self.job_id,
             "revision": plan.revision,
             "complete": not missing,
-            "missingRequiredTickets": missing,
+            "missing_required_tickets": missing,
         }
+
+    def resolved_but_unchecked(self) -> list[int]:
+        """Tickets tasks.md shows unchecked that a succeeded receipt resolves.
+
+        Baton will not re-run these (the receipt is the durable fact), so the
+        checkbox — a manual un-check, or a write-back lost to a checkout —
+        must be surfaced rather than silently overridden.
+        """
+        if not self.db_path.is_file():
+            return []
+        ready = {
+            ticket.num
+            for ticket in self._read_source_tickets()
+            if ticket.status == "ready"
+        }
+        conn = self._read_only_connect()
+        try:
+            return sorted(ready & set(self._receipt_resolved_locked(conn)))
+        finally:
+            conn.close()
+
+    def is_ticket_resolved(self, ticket_num: int) -> bool:
+        """Whether tasks.md or a succeeded receipt already resolves the ticket."""
+        conn = self._read_only_connect() if self.db_path.is_file() else None
+        try:
+            by_receipt = conn is not None and ticket_num in self._receipt_resolved_locked(conn)
+        finally:
+            if conn is not None:
+                conn.close()
+        if by_receipt:
+            return True
+        try:
+            tickets = self._read_source_tickets()
+        except PlanStoreError:
+            return False
+        return any(t.num == ticket_num and t.status == "resolved" for t in tickets)
+
+    def has_run_history(self) -> bool:
+        """Whether this change ever ran here — read-only, creates nothing."""
+        if not self.db_path.is_file():
+            return False
+        conn = self._read_only_connect()
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM plan_revisions WHERE job_id = ? "
+                "UNION ALL SELECT 1 FROM execution_attempts WHERE job_id = ? LIMIT 1",
+                (self.job_id, self.job_id),
+            ).fetchone()
+        finally:
+            conn.close()
+        return row is not None
 
     def snapshot(self) -> dict[str, Any]:
         """Read the run state for a progress report — creating nothing.
@@ -190,8 +284,7 @@ class PlanStore(AttemptStoreMixin):
         attempts: list[dict[str, Any]] = []
         revision = 0
         if self.db_path.is_file():
-            conn = sqlite3.connect(self.db_path, timeout=30)
-            conn.row_factory = sqlite3.Row
+            conn = self._read_only_connect()
             try:
                 row = conn.execute(
                     "SELECT MAX(revision) AS revision FROM plan_revisions "
@@ -208,23 +301,29 @@ class PlanStore(AttemptStoreMixin):
                         (self.job_id,),
                     )
                 ]
-                resolved.update(
-                    int(row["ticket_num"])
-                    for row in conn.execute(
-                        "SELECT ticket_num FROM result_envelopes "
-                        "WHERE job_id = ? AND status = 'succeeded'",
-                        (self.job_id,),
-                    )
-                )
+                resolved.update(self._receipt_resolved_locked(conn))
             finally:
                 conn.close()
         missing = sorted(ticket.num for ticket in tickets if ticket.num not in resolved)
         return {
             "revision": revision,
             "complete": not missing,
-            "missingRequiredTickets": missing,
+            "missing_required_tickets": missing,
+            "resolved_but_unchecked": sorted(
+                ticket.num
+                for ticket in tickets
+                if ticket.status == "ready" and ticket.num in resolved
+            ),
             "attempts": attempts,
         }
+
+    def _receipt_resolved_locked(self, conn: sqlite3.Connection) -> dict[int, str]:
+        rows = conn.execute(
+            "SELECT ticket_num FROM result_envelopes "
+            "WHERE job_id = ? AND status = 'succeeded'",
+            (self.job_id,),
+        ).fetchall()
+        return {int(row["ticket_num"]): "resolved" for row in rows}
 
     def events(self) -> list[dict[str, Any]]:
         self.ensure_initial_plan()
@@ -246,10 +345,22 @@ class PlanStore(AttemptStoreMixin):
         finally:
             conn.close()
 
+    def events_count(self) -> int:
+        self.ensure_initial_plan()
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM events WHERE job_id = ?", (self.job_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        return int(row["n"])
+
     def _ensure_dirs(self) -> None:
         self.baton_dir.mkdir(parents=True, exist_ok=True)
         self.feature_dir.mkdir(parents=True, exist_ok=True)
         self.results_dir.mkdir(parents=True, exist_ok=True)
+        exclude_runtime_dir(self.project_path)
 
     def _connect(self) -> sqlite3.Connection:
         self._ensure_dirs()
@@ -258,29 +369,24 @@ class PlanStore(AttemptStoreMixin):
         init_db(conn)
         return conn
 
+    def _read_only_connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        return conn
+
     def _read_source_tickets(self) -> list[Ticket]:
         """Parse the change's tasks.md — the single ticket source."""
         try:
             return parse_tasks_md(self.tasks_path)
         except TasksMarkdownError as exc:
-            raise PlanStoreError(str(exc)) from exc
+            raise PlanStoreError(str(exc), code="tasks-md-invalid") from exc
 
     @staticmethod
     def _tickets_hash(tickets: list[PlanTicket]) -> str:
-        """Hash the ticket set for change detection.
+        """Hash the ticket set for change detection."""
+        return stable_hash([ticket.to_dict() for ticket in tickets])
 
-        ``source_revision`` is projected out: candidates are parsed with the
-        *next* revision number stamped in, so including it would make every
-        sync look like a change (runaway revision creep).
-        """
-        def projection(ticket: PlanTicket) -> dict[str, Any]:
-            data = ticket.to_dict()
-            data["source_revision"] = 0
-            return data
-
-        return stable_hash([projection(t) for t in tickets])
-
-    def _plan_tickets_from_source(self, revision: int) -> list[PlanTicket]:
+    def _plan_tickets_from_source(self) -> list[PlanTicket]:
         return [
             PlanTicket(
                 num=parsed.num,
@@ -289,7 +395,6 @@ class PlanStore(AttemptStoreMixin):
                 blocked_by=parsed.blocked_by,
                 status=parsed.status,
                 criteria=[text for _, text in parsed.criteria],
-                source_revision=revision,
             )
             for parsed in self._read_source_tickets()
         ]
@@ -304,11 +409,12 @@ class PlanStore(AttemptStoreMixin):
         No plan yet → revision 1. tasks.md changed since the latest revision
         (human edits, added tasks, or baton's own ``[x]`` write-backs) → a
         fresh revision, so the next frontier reflects the current file. In-flight
-        attempts keep their immutable packets and are never rewritten.
+        attempts keep their immutable packets and are never rewritten; the
+        controller compares their ticket text against the new revision.
         """
         current = self._load_current_plan_locked(conn)
         candidate_revision = 1 if current is None else current.revision + 1
-        tickets = self._plan_tickets_from_source(candidate_revision)
+        tickets = self._plan_tickets_from_source()
         if (
             current is not None
             and self._tickets_hash(tickets) == self._tickets_hash(current.tickets)
@@ -340,7 +446,6 @@ class PlanStore(AttemptStoreMixin):
             },
         )
         return plan
-
 
     def _load_current_plan_locked(
         self,
@@ -382,7 +487,6 @@ class PlanStore(AttemptStoreMixin):
             ),
         )
 
-
     def _event_locked(
         self,
         conn: sqlite3.Connection,
@@ -404,7 +508,6 @@ class PlanStore(AttemptStoreMixin):
 
     def _write_plan_json(self, plan: PlanRevision) -> None:
         _atomic_write(self.plan_path, _pretty_json(plan.to_dict()))
-
 
     def _result_envelope_id(self, envelope: ResultEnvelope) -> str:
         if envelope.assignment_id:

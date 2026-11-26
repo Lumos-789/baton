@@ -175,8 +175,42 @@ def test_documented_invocations_match_the_real_cli(doc):
 
 def test_skill_documents_every_verb_the_loop_needs():
     skill = (ROOT / "skills" / "baton" / "SKILL.md").read_text(encoding="utf-8")
-    for verb in ("actions", "bind", "reconcile", "status", "cleanup", "abandon", "adopt"):
+    for verb in (
+        "actions",
+        "bind",
+        "reconcile",
+        "status",
+        "cleanup",
+        "abandon",
+        "adopt",
+        "reopen",
+    ):
         assert f"| `{verb}" in skill, f"SKILL.md has no row for `{verb}`"
+
+
+def test_skill_documents_every_action_kind_the_batch_can_carry():
+    """A forwarder that meets an undocumented action kind has to improvise."""
+    skill = (ROOT / "skills" / "baton" / "SKILL.md").read_text(encoding="utf-8")
+    from orchestration.session_model import (  # noqa: E402
+        BlockedAction,
+        CompleteAction,
+        DispatchAction,
+        RecoverAction,
+        RepairIntegrationAction,
+        ResolveMergeAction,
+        WaitAction,
+    )
+
+    for action in (
+        DispatchAction,
+        ResolveMergeAction,
+        RepairIntegrationAction,
+        RecoverAction,
+        WaitAction,
+        BlockedAction,
+        CompleteAction,
+    ):
+        assert f"`{action.kind}`" in skill, f"SKILL.md never names `{action.kind}`"
 
 
 def test_skill_does_not_promise_a_removed_verb_or_session_default():

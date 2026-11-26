@@ -2,63 +2,25 @@
 
 from __future__ import annotations
 
-import shutil
 import json
-import subprocess
-import sys
 import time
 from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
-
+from baton_helpers import (  # noqa: E402
+    dispatches as _dispatches,
+    fixture_controller as _controller,
+    fixture_project as _project,
+    finish as _finish,
+    git as _git,
+    packet_payload as _packet_payload,
+    seal_all as _seal_all,
+)
 from orchestration.plan_store import ExecutionAttemptError  # noqa: E402
 from orchestration.receipt import seal_receipt  # noqa: E402
-from orchestration.relay import ABANDON_GUARD_FRACTION  # noqa: E402
-from orchestration.session_controller import (  # noqa: E402
-    SessionController,
-    SessionControllerError,
-)
+from orchestration.session_controller import SessionController, SessionControllerError  # noqa: E402
 from orchestration.worktree import WorktreeError  # noqa: E402
-
-FIXTURES = Path(__file__).parent / "fixtures" / "sample-change"
-
-
-def _git(path: Path, *args: str) -> str:
-    result = subprocess.run(
-        ["git", *args], cwd=path, capture_output=True, text=True, check=True
-    )
-    return result.stdout.strip()
-
-
-def _project(tmp_path: Path) -> Path:
-    project = tmp_path / "project"
-    project.mkdir()
-    _git(project, "init", "-b", "main")
-    _git(project, "config", "user.email", "t@t.t")
-    _git(project, "config", "user.name", "test")
-    (project / ".gitignore").write_text(".dsh/\n", encoding="utf-8")
-    (project / "base.txt").write_text("base\n", encoding="utf-8")
-    _git(project, "add", "-A")
-    _git(project, "commit", "-m", "init")
-    change = project / "openspec" / "changes" / "feature"
-    change.mkdir(parents=True)
-    for source in FIXTURES.glob("*.md"):
-        shutil.copy(source, change / source.name)
-    return project
-
-
-VERIFY = ["test -f base.txt"]
-
-
-def _controller(project: Path, **kwargs) -> SessionController:
-    kwargs.setdefault("verification_commands", VERIFY)
-    return SessionController(project, "feature", **kwargs)
-
-
-def _dispatches(batch):
-    return [action for action in batch.actions if action.kind == "dispatch"]
 
 
 def test_actions_returns_distinct_dispatches_and_no_prd(tmp_path):
@@ -118,12 +80,16 @@ def test_terminal_free_text_without_receipt_becomes_unknown(tmp_path):
         action.claim_token,
         agent_terminal="completed",
         session_id="session-a",
-        final_text="Succeeded, commit deadbeef, all tests green",
+        reason="Succeeded, commit deadbeef, all tests green",
     )
 
     attempt = controller.store.get_execution_attempt(action.assignment_id)
     assert attempt.state == "unknown"
-    assert batch.actions[0].kind == "recover"
+    recover = batch.actions[0]
+    assert recover.kind == "recover"
+    assert recover.reason == "agent-completed-without-sealed-receipt"
+    # The account is kept for diagnosis and nothing more: it is no evidence.
+    assert "Succeeded, commit deadbeef" in recover.detail
     assert not controller.store.latest_completion()["complete"]
 
 
@@ -186,7 +152,7 @@ def test_reconcile_ignores_free_text_without_valid_receipt(tmp_path):
         action.claim_token,
         agent_terminal="completed",
         session_id="session-a",
-        final_text="All done! Tests green, committed as deadbeef. Ticket resolved.",
+        reason="All done! Tests green, committed as deadbeef. Ticket resolved.",
     )
 
     attempt = controller.store.get_execution_attempt(action.assignment_id)
@@ -214,20 +180,8 @@ def test_resume_after_receipt_auto_reconciles(tmp_path):
     attempt = controller.store.get_execution_attempt(action.assignment_id)
     assert attempt.state == "succeeded"
     # The integrated ticket is no longer in the missing-required list.
-    missing = controller.store.latest_completion()["missingRequiredTickets"]
+    missing = controller.store.latest_completion()["missing_required_tickets"]
     assert attempt.ticket_num not in missing
-
-
-def _finish(action, marker: str) -> None:
-    worktree = Path(action.cwd)
-    (worktree / marker).write_text("done\n", encoding="utf-8")
-    _git(worktree, "add", "-A")
-    _git(worktree, "commit", "-m", f"finish {marker}")
-    seal_receipt(action.packet_path)
-
-
-def _packet_payload(action) -> dict:
-    return json.loads(Path(action.packet_path).read_text(encoding="utf-8"))
 
 
 @pytest.mark.parametrize(
@@ -245,7 +199,11 @@ def _packet_payload(action) -> dict:
     ],
 )
 def test_reconcile_rejects_tampered_sealed_receipt(tmp_path, segment, tamper):
-    """Editing any receipt body field must be rejected before integration."""
+    """Editing any receipt body field must be rejected before integration.
+
+    The rejection is a ``recover`` action naming the edited segment — one bad
+    receipt must not turn the whole call into an error that hides the rest.
+    """
     project = _project(tmp_path)
     controller = _controller(project)
     action = _dispatches(controller.actions("session-a", capacity=1))[0]
@@ -259,22 +217,22 @@ def test_reconcile_rejects_tampered_sealed_receipt(tmp_path, segment, tamper):
     tamper(receipt)
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
 
-    with pytest.raises(SessionControllerError, match="receiptHash") as excinfo:
-        controller.reconcile(
-            action.assignment_id,
-            action.claim_token,
-            agent_terminal="completed",
-            session_id="session-a",
-        )
+    batch = controller.reconcile(
+        action.assignment_id,
+        action.claim_token,
+        agent_terminal="completed",
+        session_id="session-a",
+    )
 
-    assert segment in str(excinfo.value)
+    recover = next(item for item in batch.actions if item.kind == "recover")
+    assert batch.state == "blocked"
+    assert recover.reason == "receipt-invalid"
+    assert "receiptHash" in recover.detail and segment in recover.detail
     assert _git(integration, "rev-parse", "HEAD") == before
     attempt = controller.store.get_execution_attempt(action.assignment_id)
     assert attempt.state == "unknown"
     assert attempt.failure_code.startswith("receipt-invalid:")
-    assert attempt.ticket_num in controller.store.latest_completion()[
-        "missingRequiredTickets"
-    ]
+    assert attempt.ticket_num in controller.store.latest_completion()["missing_required_tickets"]
 
 
 def test_wrong_ticket_receipt_rejected_before_branch_merge(tmp_path):
@@ -294,15 +252,17 @@ def test_wrong_ticket_receipt_rejected_before_branch_merge(tmp_path):
     forged_envelope = seal_receipt(forged_packet)
     assert forged_envelope.ticket_num == action.ticket_num + 1
 
-    with pytest.raises(SessionControllerError, match="ticket_num") as excinfo:
-        controller.reconcile(
-            action.assignment_id,
-            action.claim_token,
-            agent_terminal="completed",
-            session_id="session-a",
-        )
+    batch = controller.reconcile(
+        action.assignment_id,
+        action.claim_token,
+        agent_terminal="completed",
+        session_id="session-a",
+    )
 
-    assert "expected=" + str(action.ticket_num) in str(excinfo.value)
+    recover = next(item for item in batch.actions if item.kind == "recover")
+    assert recover.reason == "receipt-invalid"
+    assert "ticket_num mismatch" in recover.detail
+    assert "expected=" + str(action.ticket_num) in recover.detail
     assert _git(integration, "rev-parse", "HEAD") == before
     attempt = controller.store.get_execution_attempt(action.assignment_id)
     assert attempt.state != "integrating"
@@ -311,9 +271,7 @@ def test_wrong_ticket_receipt_rejected_before_branch_merge(tmp_path):
     # surface the rejected attempt instead of having merged the wrong branch.
     batch = controller.actions("session-a", capacity=1)
     assert any(action.kind == "recover" for action in batch.actions)
-    assert action.ticket_num in controller.store.latest_completion()[
-        "missingRequiredTickets"
-    ]
+    assert action.ticket_num in controller.store.latest_completion()["missing_required_tickets"]
 
 
 def test_lease_expiry_supersedes_stale_attempt_and_completes_later_tickets(tmp_path):
@@ -405,7 +363,7 @@ def test_abandon_clears_stuck_attempt_and_allows_a_retry(tmp_path):
     result = controller.abandon(first.assignment_id, reason="test-escape-hatch")
 
     assert result["state"] == "abandoned"
-    assert result["ticketNum"] == first.ticket_num
+    assert result["ticket_num"] == first.ticket_num
     assert "worktree" in result["preserves"]
     retried = _dispatches(controller.actions("session-a", capacity=1))
     assert [action.ticket_num for action in retried] == [first.ticket_num]
@@ -477,14 +435,6 @@ def test_no_verification_commands_fails_loud_instead_of_defaulting(tmp_path):
         controller.actions("session-a", capacity=1)
 
     assert controller.store.run_verification_commands() == []
-
-
-def _seal_all(assignments) -> None:
-    for action in assignments:
-        worktree = Path(action.cwd)
-        _git(worktree, "add", "-A")
-        _git(worktree, "commit", "-m", f"ticket {action.ticket_num}")
-        seal_receipt(action.packet_path)
 
 
 def test_conflict_is_attributed_only_to_the_conflicting_assignment(tmp_path):
@@ -583,7 +533,7 @@ def test_hard_integration_failure_is_reported_and_leaves_no_wedge(
     tmp_path, monkeypatch
 ):
     """A merge that fails without conflict files must not strand the attempt."""
-    import orchestration.session_controller as session_controller
+    import orchestration.receipt_flow as receipt_flow
 
     project = _project(tmp_path)
     controller = _controller(project)
@@ -594,7 +544,7 @@ def test_hard_integration_failure_is_reported_and_leaves_no_wedge(
     def boom(*args, **kwargs):
         raise WorktreeError("fatal: refusing to merge unrelated histories")
 
-    monkeypatch.setattr(session_controller, "integrate_assignment", boom)
+    monkeypatch.setattr(receipt_flow, "integrate_assignment", boom)
 
     batch = controller.actions("session-a", capacity=1)
 
@@ -606,473 +556,3 @@ def test_hard_integration_failure_is_reported_and_leaves_no_wedge(
     assert attempt.failure_code.startswith("integration-failed")
 
 
-# --- relay: the 2026-11-06 fusion-s1 incident, replayed ---------------------
-
-
-def test_incident_replay_spawned_no_receipt_reads_alive_and_guards_abandon(
-    tmp_path,
-):
-    """The incident shape: spawned, mid-lease, no receipt, clean worktree.
-
-    status must say "wait" with the judgment data, and abandon must be
-    refused (the escape hatch is one --force away, but never free).
-    """
-    project = _project(tmp_path)
-    controller = _controller(project)
-    action = _dispatches(controller.actions("session-a", capacity=1))[0]
-    controller.bind_agent(action.assignment_id, action.claim_token, "agent-1")
-
-    status = controller.status()
-    entry = next(
-        item
-        for item in status["attempts"]
-        if item["assignment_id"] == action.assignment_id
-    )
-    relay = entry["relay"]
-    assert entry["state"] == "spawned"
-    assert relay["suggestedAction"] == "wait"
-    assert relay["receiptExists"] is False
-    assert relay["elapsedSec"] is not None and relay["elapsedSec"] < 60
-    assert relay["leaseRemainingSec"] > 7000
-    assert relay["leaseElapsedFraction"] < ABANDON_GUARD_FRACTION
-    assert relay["worktree"]["exists"] is True
-
-    with pytest.raises(SessionControllerError, match="abandon refused") as excinfo:
-        controller.abandon(action.assignment_id)
-    refusal = json.loads(str(excinfo.value).split("abandon refused — ", 1)[1])
-    assert refusal["state"] == "spawned"
-    assert refusal["suggestedAction"] == "wait"
-    assert refusal["leaseRemainingSec"] > 7000
-    assert "--force" in refusal["force"]
-
-    forced = controller.abandon(action.assignment_id, force=True)
-    assert forced["state"] == "abandoned"
-
-
-def test_dispatch_prompt_teaches_the_heartbeat(tmp_path):
-    """The prompt must tell the subagent to refresh the out-of-worktree
-    heartbeat file, so a relay session can observe liveness."""
-    project = _project(tmp_path)
-    controller = _controller(project)
-    action = _dispatches(controller.actions("session-a", capacity=1))[0]
-
-    assert "heartbeat" in action.prompt
-    heartbeat = Path(action.packet_path).parent / "progress"
-    assert f"`{heartbeat}`" in action.prompt
-    assert "never commit it" in action.prompt
-
-
-def test_status_relay_says_adopt_for_abandoned_attempt_with_late_receipt(
-    tmp_path,
-):
-    project = _project(tmp_path)
-    controller = _controller(project)
-    action = _dispatches(controller.actions("session-a", capacity=1))[0]
-    controller.abandon(action.assignment_id, force=True)
-    _finish(action, "task-2.1.txt")
-
-    status = controller.status()
-    entry = next(
-        item
-        for item in status["attempts"]
-        if item["assignment_id"] == action.assignment_id
-    )
-    assert entry["state"] == "abandoned"
-    assert entry["relay"]["receiptExists"] is True
-    assert entry["relay"]["suggestedAction"] == "adopt"
-
-
-def test_late_sealed_receipt_after_abandon_is_adopted(tmp_path):
-    """The incident repaired: the abandoned subagent finished and sealed.
-
-    The protocol ignores the late receipt (terminal state); `adopt` re-enters
-    it through the normal verify → integrate path, so the ticket lands with
-    zero re-work.
-    """
-    project = _project(tmp_path)
-    controller = _controller(project)
-    action = _dispatches(controller.actions("session-a", capacity=1))[0]
-    controller.bind_agent(action.assignment_id, action.claim_token, "agent-1")
-    controller.abandon(action.assignment_id, force=True)
-
-    # The subagent was alive all along; the receipt lands after the abandon.
-    _finish(action, "task-2.1.txt")
-
-    # Sanity: the terminal state makes the protocol ignore the sealed receipt
-    # — no envelope was recorded. That silence is the incident.
-    assert controller.store.result_envelopes() == []
-
-    result = controller.adopt(action.assignment_id)
-
-    assert result["adoptedFrom"] == "abandoned"
-    assert result["state"] == "succeeded"
-    assert result["followUp"] is None
-    attempt = controller.store.get_execution_attempt(action.assignment_id)
-    assert attempt.state == "succeeded"
-    assert attempt.commit_sha
-    assert attempt.ticket_num not in controller.store.latest_completion()[
-        "missingRequiredTickets"
-    ]
-    tasks_md = (project / "openspec" / "changes" / "feature" / "tasks.md").read_text(
-        encoding="utf-8"
-    )
-    assert "- [x] 2.1" in tasks_md
-
-    # The run proceeds to the next ticket — no re-claim of 201.
-    batch = controller.actions("session-a", capacity=1)
-    assert [item.ticket_num for item in _dispatches(batch)] == [202]
-
-
-def test_adopt_refuses_when_a_successor_already_sealed(tmp_path):
-    """Two sealed receipts for one ticket: adopt must not pick a winner."""
-    project = _project(tmp_path)
-    controller = _controller(project)
-    first = _dispatches(controller.actions("session-a", capacity=1))[0]
-    controller.abandon(first.assignment_id, force=True)
-
-    retry = _dispatches(controller.actions("session-a", capacity=1))[0]
-    assert retry.assignment_id != first.assignment_id
-    _finish(retry, "task-2.1-retry.txt")
-    controller.reconcile(
-        retry.assignment_id,
-        retry.claim_token,
-        agent_terminal="completed",
-        session_id="session-a",
-    )
-
-    _finish(first, "task-2.1.txt")  # the late receipt finally arrives
-
-    with pytest.raises(SessionControllerError, match="sealed evidence") as excinfo:
-        controller.adopt(first.assignment_id)
-    message = str(excinfo.value)
-    assert first.assignment_id in message and retry.assignment_id in message
-    assert _packet_payload(first)["receiptPath"] in message  # both evidence sets listed
-    # Nothing changed: the human still owns the choice.
-    assert controller.store.get_execution_attempt(first.assignment_id).state == (
-        "abandoned"
-    )
-    assert controller.store.get_execution_attempt(retry.assignment_id).state == (
-        "succeeded"
-    )
-
-
-def test_adopt_refuses_while_a_successor_is_in_flight(tmp_path):
-    project = _project(tmp_path)
-    controller = _controller(project)
-    first = _dispatches(controller.actions("session-a", capacity=1))[0]
-    controller.abandon(first.assignment_id, force=True)
-
-    retry = _dispatches(controller.actions("session-a", capacity=1))[0]
-    controller.bind_agent(retry.assignment_id, retry.claim_token, "agent-2")
-    _finish(first, "task-2.1.txt")
-
-    with pytest.raises(SessionControllerError, match="still in flight") as excinfo:
-        controller.adopt(first.assignment_id)
-    assert retry.assignment_id in str(excinfo.value)
-    assert controller.store.get_execution_attempt(first.assignment_id).state == (
-        "abandoned"
-    )
-
-
-def test_adopt_requires_an_abandoned_attempt_with_a_receipt(tmp_path):
-    project = _project(tmp_path)
-    controller = _controller(project)
-    action = _dispatches(controller.actions("session-a", capacity=1))[0]
-
-    with pytest.raises(SessionControllerError, match="only abandoned"):
-        controller.adopt(action.assignment_id)  # still spawned/leased
-
-    controller.abandon(action.assignment_id, force=True)  # no receipt yet
-
-    with pytest.raises(SessionControllerError, match="no sealed receipt"):
-        controller.adopt(action.assignment_id)
-    assert controller.store.get_execution_attempt(action.assignment_id).state == (
-        "abandoned"
-    )
-
-
-def test_adopt_rejects_a_tampered_receipt_and_stays_abandoned(tmp_path):
-    project = _project(tmp_path)
-    controller = _controller(project)
-    action = _dispatches(controller.actions("session-a", capacity=1))[0]
-    _finish(action, "task-2.1.txt")
-    controller.abandon(action.assignment_id, force=True)
-
-    receipt_path = Path(_packet_payload(action)["receiptPath"])
-    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    receipt["commit_sha"] = "0" * 40
-    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
-
-    with pytest.raises(SessionControllerError, match="stays abandoned"):
-        controller.adopt(action.assignment_id)
-    assert controller.store.get_execution_attempt(action.assignment_id).state == (
-        "abandoned"
-    )
-    assert action.ticket_num in controller.store.latest_completion()[
-        "missingRequiredTickets"
-    ]
-
-
-def test_adopt_surviving_merge_conflict_parks_in_blocked_review(tmp_path):
-    """A revived receipt that hits a real conflict follows the normal
-    resolve_merge path instead of being force-merged."""
-    project = _project(tmp_path)
-    controller = _controller(project)
-    action = _dispatches(controller.actions("session-a", capacity=1))[0]
-    packet = _packet_payload(action)
-    integration = Path(packet["integrationPath"])
-    (integration / "base.txt").write_text("integration\n", encoding="utf-8")
-    _git(integration, "add", "-A")
-    _git(integration, "commit", "-m", "integration change")
-    (Path(action.cwd) / "base.txt").write_text("assignment\n", encoding="utf-8")
-    _git(Path(action.cwd), "add", "-A")
-    _git(Path(action.cwd), "commit", "-m", "assignment change")
-    seal_receipt(action.packet_path)
-    controller.abandon(action.assignment_id, force=True)
-
-    result = controller.adopt(action.assignment_id)
-
-    assert result["state"] == "blocked-review"
-    assert "resolve_merge" in result["followUp"]
-    attempt = controller.store.get_execution_attempt(action.assignment_id)
-    assert attempt.state == "blocked-review"
-    assert attempt.failure_code == "merge-conflict"
-
-
-# --- the branch advanced past the sealed commit (P1 pair) --------------------
-
-
-def _advance_branch(action, marker: str) -> str:
-    """Commit ``marker`` on the assignment branch after the seal; return tip."""
-    worktree = Path(action.cwd)
-    (worktree / marker).write_text("committed after seal, never verified\n", encoding="utf-8")
-    _git(worktree, "add", "-A")
-    _git(worktree, "commit", "-m", f"post-seal {marker}")
-    return _git(worktree, "rev-parse", "HEAD")
-
-
-def test_branch_advanced_after_seal_is_never_integrated(tmp_path):
-    """A commit added after the seal never ran verification — refuse to merge.
-
-    The receipt verified C1; the reconcile must not silently integrate the
-    branch tip instead. The attempt parks in blocked-review with a named
-    failure, the action carries the actual tip and the expected sha, and both
-    exits (re-seal at the new tip / abandon) stay available.
-    """
-    project = _project(tmp_path)
-    controller = _controller(project)
-    action = _dispatches(controller.actions("session-a", capacity=1))[0]
-    _finish(action, "task-2.1.txt")
-    worktree = Path(action.cwd)
-    sealed = _git(worktree, "rev-parse", "HEAD")
-    integration = Path(_packet_payload(action)["integrationPath"])
-    before = _git(integration, "rev-parse", "HEAD")
-    moved = _advance_branch(action, "UNVERIFIED.txt")
-
-    batch = controller.reconcile(
-        action.assignment_id,
-        action.claim_token,
-        agent_terminal="completed",
-        session_id="session-a",
-    )
-
-    blocked = [item for item in batch.actions if item.kind == "blocked"]
-    assert [item.code for item in blocked] == ["branch-moved-after-seal"]
-    assert moved in blocked[0].reason and sealed in blocked[0].reason
-    assert "abandon" in blocked[0].reason
-    attempt = controller.store.get_execution_attempt(action.assignment_id)
-    assert attempt.state == "blocked-review"
-    assert attempt.failure_code == "branch-moved-after-seal"
-    assert _git(integration, "rev-parse", "HEAD") == before
-    assert not (integration / "UNVERIFIED.txt").exists()
-    assert action.ticket_num in controller.store.latest_completion()[
-        "missingRequiredTickets"
-    ]
-
-    # Not a one-shot message: the next actions() keeps surfacing the block.
-    again = controller.actions("session-a", capacity=1)
-    assert [item.code for item in again.actions if item.kind == "blocked"] == [
-        "branch-moved-after-seal"
-    ]
-
-    # The abandon exit stays cheap (blocked-review is failure evidence, never
-    # guarded) and the ticket is re-claimed fresh.
-    controller.abandon(action.assignment_id)
-    retried = _dispatches(controller.actions("session-a", capacity=1))
-    assert [item.ticket_num for item in retried] == [action.ticket_num]
-    assert retried[0].assignment_id != action.assignment_id
-
-
-def test_branch_moved_after_seal_recovers_by_resealing_at_new_tip(tmp_path):
-    """The documented recovery: seal again at the advanced tip.
-
-    ``seal`` re-runs the verification commands on the new HEAD, so the new
-    receipt legitimately verifies the tip and integration proceeds.
-    """
-    project = _project(tmp_path)
-    controller = _controller(project)
-    action = _dispatches(controller.actions("session-a", capacity=1))[0]
-    _finish(action, "task-2.1.txt")
-    _advance_branch(action, "UNVERIFIED.txt")
-    integration = Path(_packet_payload(action)["integrationPath"])
-
-    blocked = controller.reconcile(
-        action.assignment_id,
-        action.claim_token,
-        agent_terminal="completed",
-        session_id="session-a",
-    )
-    assert [item.code for item in blocked.actions if item.kind == "blocked"] == [
-        "branch-moved-after-seal"
-    ]
-
-    seal_receipt(action.packet_path)  # verification re-runs at the new tip
-    batch = controller.actions("session-a", capacity=1)
-
-    assert not any(
-        item.kind == "blocked" and item.code == "branch-moved-after-seal"
-        for item in batch.actions
-    )
-    attempt = controller.store.get_execution_attempt(action.assignment_id)
-    assert attempt.state == "succeeded"
-    assert (integration / "UNVERIFIED.txt").exists()
-    assert attempt.ticket_num not in controller.store.latest_completion()[
-        "missingRequiredTickets"
-    ]
-
-
-def test_conflicted_attempt_keeps_resolve_merge_after_branch_advance(tmp_path):
-    """A preserved conflict stays owned by its assignment when the branch moves.
-
-    Ownership was judged by MERGE_HEAD vs the *current* tip; one post-conflict
-    commit turned the owner into a bystander and the attempt silently sat in
-    blocked-review forever (only wait actions, lease expiry does not cover
-    blocked-review). Ownership must track the receipt's verified commit.
-    """
-    project = _project(tmp_path)
-    controller = _controller(project)
-    action = _dispatches(controller.actions("session-a", capacity=1))[0]
-    packet = _packet_payload(action)
-    integration = Path(packet["integrationPath"])
-    worktree = Path(action.cwd)
-
-    (integration / "base.txt").write_text("integration\n", encoding="utf-8")
-    _git(integration, "add", "-A")
-    _git(integration, "commit", "-m", "integration change")
-    (worktree / "base.txt").write_text("assignment\n", encoding="utf-8")
-    _git(worktree, "add", "-A")
-    _git(worktree, "commit", "-m", "assignment change")
-    seal_receipt(action.packet_path)
-
-    batch = controller.reconcile(
-        action.assignment_id,
-        action.claim_token,
-        agent_terminal="completed",
-        session_id="session-a",
-    )
-    assert batch.actions[0].kind == "resolve_merge"
-
-    moved_tip = _advance_branch(action, "extra.txt")
-    merge_head = _git(integration, "rev-parse", "MERGE_HEAD")
-    assert moved_tip != merge_head
-
-    # The advanced tip must not cost the assignment its resolve_merge action.
-    for _ in range(2):
-        batch = controller.actions("session-a", capacity=1)
-        merges = [
-            item
-            for item in batch.actions
-            if item.kind == "resolve_merge"
-            and item.assignment_id == action.assignment_id
-        ]
-        assert len(merges) == 1
-
-    # Resolve the preserved merge as the action instructs, then reconcile.
-    (integration / "base.txt").write_text("resolved\n", encoding="utf-8")
-    _git(integration, "add", "-A")
-    _git(integration, "commit", "--no-edit")
-
-    controller.actions("session-a", capacity=1)
-
-    attempt = controller.store.get_execution_attempt(action.assignment_id)
-    assert attempt.state == "succeeded"
-    assert attempt.commit_sha == merge_head
-    assert not (integration / "extra.txt").exists()
-    tasks_md = (
-        project / "openspec" / "changes" / "feature" / "tasks.md"
-    ).read_text(encoding="utf-8")
-    assert "- [x] 2.1" in tasks_md
-    assert action.ticket_num not in controller.store.latest_completion()[
-        "missingRequiredTickets"
-    ]
-
-
-# --- blocked-review without a re-readable receipt dispatches by failure code
-
-
-def _drop_receipt_and_packet(action) -> None:
-    payload = _packet_payload(action)
-    Path(payload["receiptPath"]).unlink()
-    Path(action.packet_path).unlink()
-
-
-def test_branch_moved_blocked_review_without_receipt_is_blocked_not_resolve_merge(
-    tmp_path,
-):
-    """A branch-moved attempt whose receipt vanished from disk must not be
-    handed a resolve_merge prompt: nothing was merged, so there is no
-    preserved merge to resolve."""
-    project = _project(tmp_path)
-    controller = _controller(project)
-    action = _dispatches(controller.actions("session-a", capacity=1))[0]
-    _finish(action, "task-2.1.txt")
-    _advance_branch(action, "UNVERIFIED.txt")
-
-    blocked = controller.reconcile(
-        action.assignment_id,
-        action.claim_token,
-        agent_terminal="completed",
-        session_id="session-a",
-    )
-    assert [item.code for item in blocked.actions if item.kind == "blocked"] == [
-        "branch-moved-after-seal"
-    ]
-
-    _drop_receipt_and_packet(action)
-    again = controller.actions("session-a", capacity=1)
-
-    assert not any(item.kind == "resolve_merge" for item in again.actions)
-    assert [item.code for item in again.actions if item.kind == "blocked"] == [
-        "branch-moved-after-seal"
-    ]
-
-
-def test_integration_failed_blocked_review_without_receipt_is_blocked_not_resolve_merge(
-    tmp_path, monkeypatch
-):
-    """Same rule for integration-failed: the failure merged nothing, so the
-    re-dispatch is the named blocked action, never a resolve_merge."""
-    import orchestration.session_controller as session_controller
-
-    project = _project(tmp_path)
-    controller = _controller(project)
-    action = _dispatches(controller.actions("session-a", capacity=1))[0]
-    (Path(action.cwd) / "ticket.txt").write_text("done\n", encoding="utf-8")
-    _seal_all([action])
-
-    def boom(*args, **kwargs):
-        raise WorktreeError("fatal: refusing to merge unrelated histories")
-
-    monkeypatch.setattr(session_controller, "integrate_assignment", boom)
-    batch = controller.actions("session-a", capacity=1)
-    assert [item.code for item in batch.actions if item.kind == "blocked"] == [
-        "integration-failed"
-    ]
-
-    _drop_receipt_and_packet(action)
-    again = controller.actions("session-a", capacity=1)
-
-    assert not any(item.kind == "resolve_merge" for item in again.actions)
-    assert [item.code for item in again.actions if item.kind == "blocked"] == [
-        "integration-failed"
-    ]
